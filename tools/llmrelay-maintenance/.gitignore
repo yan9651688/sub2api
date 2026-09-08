@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+worktrees/
+*.log
+.env
+*.dump

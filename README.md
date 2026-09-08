@@ -1,4 +1,4 @@
-> LLMRelay 定制版：当前版本 `0.2.2-llmrelay.2`，版本规则、功能补丁与构建说明见 [LLMRELAY.md](docs/LLMRELAY.md)。
+> LLMRelay 定制版：当前版本 `0.2.3-llmrelay.1`，版本规则、功能补丁与构建说明见 [LLMRELAY.md](docs/LLMRELAY.md)。
 
 <div align="center">
 

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "base_revision": "8fa67d477d6651a744754392a8982ea589c26ae6",
+  "patches": [
+    {
+      "file": "0001-llmrelay-customizations.patch",
+      "sha256": "d9e2ba5b51c37138981a2501e5e439dc8952415fa2a865dd39ddde94f1581040"
+    }
+  ]
+}

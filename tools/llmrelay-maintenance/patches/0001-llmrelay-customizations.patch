@@ -1,0 +1,2783 @@
+diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
+index ee1372d33..f4d94fff4 100644
+--- a/backend/cmd/server/VERSION
++++ b/backend/cmd/server/VERSION
+@@ -1 +1 @@
+-0.2.2
++0.2.3-llmrelay.1
+diff --git a/backend/internal/config/config.go b/backend/internal/config/config.go
+index 5d04ab530..784cef8c2 100644
+--- a/backend/internal/config/config.go
++++ b/backend/internal/config/config.go
+@@ -960,6 +960,9 @@ type GatewayConfig struct {
+ 	// OpenAIHighEffortFirstOutputTimeoutSeconds: high/xhigh/max 推理的首个语义输出超时（秒）。
+ 	// 0 表示回退到 OpenAIFirstOutputTimeoutSeconds。
+ 	OpenAIHighEffortFirstOutputTimeoutSeconds int `mapstructure:"openai_high_effort_first_output_timeout_seconds"`
++	// OpenAIAPIKeyAvailabilityEnabled opts non-pool OpenAI API keys into immediate
++	// model cooldown and next-account failover for recoverable upstream failures.
++	OpenAIAPIKeyAvailabilityEnabled bool `mapstructure:"openai_apikey_availability_enabled"`
+ 	// 请求体最大字节数，用于网关请求体大小限制
+ 	MaxBodySize int64 `mapstructure:"max_body_size"`
+ 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
+@@ -2362,6 +2365,7 @@ func setDefaults() {
+ 	viper.SetDefault("gateway.grok_response_header_timeout", 120)
+ 	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
+ 	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
++	viper.SetDefault("gateway.openai_apikey_availability_enabled", false)
+ 	viper.SetDefault("gateway.log_upstream_error_body", true)
+ 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
+ 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
+diff --git a/backend/internal/config/openai_apikey_availability_test.go b/backend/internal/config/openai_apikey_availability_test.go
+new file mode 100644
+index 000000000..af0b6fadb
+--- /dev/null
++++ b/backend/internal/config/openai_apikey_availability_test.go
+@@ -0,0 +1,26 @@
++package config
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestLoadOpenAIAPIKeyAvailability(t *testing.T) {
++	for _, tc := range []struct {
++		name, env string
++		want      bool
++	}{
++		{name: "disabled by default"},
++		{name: "enabled by environment", env: "true", want: true},
++		{name: "explicitly disabled", env: "false"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			resetViperWithJWTSecret(t)
++			t.Setenv("GATEWAY_OPENAI_APIKEY_AVAILABILITY_ENABLED", tc.env)
++			cfg, err := Load()
++			require.NoError(t, err)
++			require.Equal(t, tc.want, cfg.Gateway.OpenAIAPIKeyAvailabilityEnabled)
++		})
++	}
++}
+diff --git a/backend/internal/handler/admin/ops_system_log_handler.go b/backend/internal/handler/admin/ops_system_log_handler.go
+index 1b6af4597..3f69cc82b 100644
+--- a/backend/internal/handler/admin/ops_system_log_handler.go
++++ b/backend/internal/handler/admin/ops_system_log_handler.go
+@@ -53,6 +53,7 @@ func (h *OpsHandler) ListSystemLogs(c *gin.Context) {
+ 	}
+ 
+ 	filter := &service.OpsSystemLogFilter{
++		Event:           strings.TrimSpace(c.Query("event")),
+ 		Page:            page,
+ 		PageSize:        pageSize,
+ 		StartTime:       &start,
+diff --git a/backend/internal/handler/openai_bootstrap_memory_test.go b/backend/internal/handler/openai_bootstrap_memory_test.go
+new file mode 100644
+index 000000000..48a89c6a9
+--- /dev/null
++++ b/backend/internal/handler/openai_bootstrap_memory_test.go
+@@ -0,0 +1,95 @@
++package handler
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"strings"
++	"testing"
++)
++
++func TestCodexBootstrapPreflightPreservesEscapedMembers(t *testing.T) {
++	body := []byte(`{"model":"gpt-5","input":[{"type":"function_call_output","namespace":"codex_app","name":"create_thread","output":"` + delegationEnvelope + `"}]}`)
++	for _, key := range []string{"input", "type", "name", "function_call_output", "create_thread"} {
++		t.Run(key, func(t *testing.T) {
++			escaped := []byte(strings.ReplaceAll(string(body), key, fmt.Sprintf(`\u%04x%s`, key[0], key[1:])))
++			got, changed := normalizeCodexDelegationBootstrap(escaped)
++			want, wantChanged := normalizeCodexCallOutputBootstrap(escaped, isCodexDelegationCandidate, true)
++			if !changed || changed != wantChanged || !bytes.Equal(got, want) {
++				t.Fatal("escaped candidate differs from original normalization")
++			}
++		})
++	}
++}
++
++func TestCodexBootstrapPreflightSkipsLargeOrdinaryHistory(t *testing.T) {
++	body := []byte(`{"tools":[{"name":"create_thread"},{"name":"automation_update"}],"input":[{"type":"message","content":"` + strings.Repeat("x", 1<<20) + `"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
++	allocs := testing.AllocsPerRun(5, func() {
++		got, changed := normalizeCodexAutomationBootstrap(body)
++		if changed || &got[0] != &body[0] {
++			t.Fatal("ordinary automation history was copied or changed")
++		}
++		got, changed = normalizeCodexDelegationBootstrap(body)
++		if changed || &got[0] != &body[0] {
++			t.Fatal("ordinary delegation history was copied or changed")
++		}
++	})
++	if allocs > 20 {
++		t.Fatalf("ordinary request still takes the full JSON decoding path: %.0f allocations", allocs)
++	}
++}
++
++// Compare the preflight with the unchanged strict implementation, including
++// malformed JSON and duplicate/escaped members. False positives are harmless;
++// a false negative would silently skip a valid bootstrap conversion.
++func FuzzCodexBootstrapPreflightEquivalent(f *testing.F) {
++	f.Add([]byte(`{"input":[]}`))
++	f.Add([]byte(`{"input":[{"type":"function_call_output","namespace":"codex_app","name":"create_thread","output":"` + delegationEnvelope + `"}]}`))
++	heartbeat, _ := json.Marshal(map[string]any{"input": []any{map[string]any{"type": "function_call_output", "namespace": "codex_app", "name": "automation_update", "output": "[Automation heartbeat]\nCheck the current state."}}})
++	f.Add(heartbeat)
++	f.Add([]byte(`{"input":[],"input":[{"type":"function_call_output","name":"create_thread"}]}`))
++	f.Add([]byte(`{"\u0069nput":[{"type":"function_call_output","namespace":"codex_app","name":"create_\u0074hread","output":"` + delegationEnvelope + `"}]}`))
++	f.Fuzz(func(t *testing.T, body []byte) {
++		if len(body) > 2<<20 {
++			t.Skip()
++		}
++		for _, tc := range []struct {
++			name      string
++			normalize func([]byte) ([]byte, bool)
++			candidate func(map[string]any) bool
++			history   bool
++		}{
++			{"automation", normalizeCodexAutomationBootstrap, isCodexAutomationCandidate, false},
++			{"delegation", normalizeCodexDelegationBootstrap, isCodexDelegationCandidate, true},
++		} {
++			got, changed := tc.normalize(body)
++			want, wantChanged := normalizeCodexCallOutputBootstrap(body, tc.candidate, tc.history)
++			if changed != wantChanged || !bytes.Equal(got, want) {
++				t.Fatalf("%s normalization differs from original", tc.name)
++			}
++		}
++	})
++}
++
++// Model the large uncompressed Responses requests seen in the deployment,
++// without copying any customer request content into the test suite.
++func BenchmarkCodexBootstrapLargeHistory(b *testing.B) {
++	for _, size := range []int{1 << 20, 8 << 20, 32 << 20} {
++		body := append([]byte(`{"model":"gpt-5","stream":true,"tools":[{"type":"function","name":"create_thread"},{"type":"function","name":"automation_update"}],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"`), bytes.Repeat([]byte("a"), size)...)
++		body = append(body, []byte(`"}]},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)...)
++		b.Run(fmt.Sprintf("%dMiB", size>>20), func(b *testing.B) {
++			b.ReportAllocs()
++			b.SetBytes(int64(len(body)))
++			for b.Loop() {
++				got, changed := normalizeCodexAutomationBootstrap(body)
++				if changed || len(got) != len(body) {
++					b.Fatal("ordinary history changed")
++				}
++				got, changed = normalizeCodexDelegationBootstrap(got)
++				if changed || len(got) != len(body) {
++					b.Fatal("ordinary history changed")
++				}
++			}
++		})
++	}
++}
+diff --git a/backend/internal/handler/openai_gateway_availability_test.go b/backend/internal/handler/openai_gateway_availability_test.go
+new file mode 100644
+index 000000000..0069e6ef0
+--- /dev/null
++++ b/backend/internal/handler/openai_gateway_availability_test.go
+@@ -0,0 +1,234 @@
++package handler
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/config"
++	middleware "github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++const availability503Error = `{"error":{"type":"server_error","code":"server_is_overloaded","message":"The server is overloaded"}}`
++
++const availability503FailedSSE = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_a\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"code\":\"server_is_overloaded\",\"message\":\"The server is overloaded\"}}}\n\n"
++
++const availabilityPartialSSE = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"content_index\":0,\"delta\":\"A partial\"}\n\n"
++
++const availabilitySuccessSSE = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_b\",\"output_index\":0,\"content_index\":0,\"delta\":\"B answer\"}\n\n" +
++	"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_b\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[{\"id\":\"msg_b\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"B answer\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
++
++type availabilityHTTPUpstream struct {
++	service.HTTPUpstream
++	mu            sync.Mutex
++	accountIDs    []int64
++	failedStatus  int
++	failedPayload string
++	transportErr  error
++	readErr       error
++	failSecond    bool
++}
++
++type availabilityErrorBody struct {
++	reader *strings.Reader
++	err    error
++}
++
++func (b *availabilityErrorBody) Read(p []byte) (int, error) {
++	if b.reader.Len() > 0 {
++		return b.reader.Read(p)
++	}
++	return 0, b.err
++}
++func (b *availabilityErrorBody) Close() error { return nil }
++
++type availabilityAccountRepo struct {
++	*openAIWSFailoverHandlerAccountRepoStub
++}
++
++func (r *availabilityAccountRepo) SetError(_ context.Context, id int64, message string) error {
++	for i := range r.accounts {
++		if r.accounts[i].ID == id {
++			r.accounts[i].Status = service.StatusError
++			r.accounts[i].Schedulable = false
++			r.accounts[i].ErrorMessage = message
++		}
++	}
++	return nil
++}
++
++func (u *availabilityHTTPUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
++	u.mu.Lock()
++	u.accountIDs = append(u.accountIDs, accountID)
++	u.mu.Unlock()
++	status, payload := http.StatusOK, availabilitySuccessSSE
++	contentType := "text/event-stream"
++	if accountID == 9910 || (u.failSecond && accountID == 9911) {
++		if u.transportErr != nil {
++			return nil, u.transportErr
++		}
++		status, payload = u.failedStatus, u.failedPayload
++		if status != http.StatusOK {
++			contentType = "application/json"
++		}
++	}
++	body := io.NopCloser(strings.NewReader(payload))
++	if accountID == 9910 && u.readErr != nil {
++		body = &availabilityErrorBody{reader: strings.NewReader(payload), err: u.readErr}
++	}
++	return &http.Response{
++		StatusCode: status,
++		Header:     http.Header{"Content-Type": []string{contentType}, "Retry-After": []string{"30"}},
++		Body:       body,
++		Request:    req,
++	}, nil
++}
++
++func (u *availabilityHTTPUpstream) calls() []int64 {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	return append([]int64(nil), u.accountIDs...)
++}
++
++func availabilityEventCount(t *testing.T, body, eventType string) int {
++	t.Helper()
++	count := 0
++	for _, line := range strings.Split(body, "\n") {
++		if !strings.HasPrefix(line, "data:") {
++			continue
++		}
++		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
++		if data == "[DONE]" {
++			continue
++		}
++		var event struct {
++			Type string `json:"type"`
++		}
++		require.NoError(t, json.Unmarshal([]byte(data), &event), "invalid SSE data: %s", data)
++		if event.Type == eventType {
++			count++
++		}
++	}
++	return count
++}
++
++func TestOpenAIResponses_APIKeyAvailabilityFailover(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, passthrough := range []bool{true, false} {
++		mode := "native"
++		if passthrough {
++			mode = "passthrough"
++		}
++		for _, tc := range []struct {
++			name          string
++			status        int
++			payload       string
++			outputStarted bool
++			transportErr  error
++			readErr       error
++			failSecond    bool
++		}{
++			{name: "http_500", status: 500, payload: `{"error":{"message":"Internal server error"}}`},
++			{name: "http_502", status: 502, payload: `{"error":{"message":"Bad gateway"}}`},
++			{name: "switch_budget_exhausted", status: 502, payload: `{"error":{"message":"Bad gateway"}}`, failSecond: true},
++			{name: "http_503", status: 503, payload: availability503Error},
++			{name: "http_504", status: 504, payload: `{"error":{"message":"Gateway timeout"}}`},
++			{name: "http_520", status: 520, payload: `{"error":{"message":"Upstream unavailable"}}`},
++			{name: "http_521", status: 521, payload: `{"error":{"message":"Upstream unavailable"}}`},
++			{name: "http_522", status: 522, payload: `{"error":{"message":"Upstream unavailable"}}`},
++			{name: "http_523", status: 523, payload: `{"error":{"message":"Upstream unavailable"}}`},
++			{name: "http_524", status: 524, payload: `{"error":{"message":"Upstream unavailable"}}`},
++			{name: "http_401_credential", status: 401, payload: `{"error":{"type":"authentication_error","code":"invalid_api_key","message":"Incorrect API key"}}`},
++			{name: "http_403_credential", status: 403, payload: `{"error":{"type":"authentication_error","code":"invalid_api_key","message":"Invalid API key"}}`},
++			{name: "http_429", status: 429, payload: `{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit exceeded"}}`},
++			{name: "sse_500", status: 200, payload: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"status_code\":500,\"message\":\"Internal server error\"}}}\n\n"},
++			{name: "sse_502", status: 200, payload: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"status_code\":502,\"message\":\"Bad gateway\"}}}\n\n"},
++			{name: "sse_503_before_output", status: 200, payload: availability503FailedSSE},
++			{name: "sse_504", status: 200, payload: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"status_code\":504,\"message\":\"Gateway timeout\"}}}\n\n"},
++			{name: "sse_503_after_output", status: 200, payload: availabilityPartialSSE + availability503FailedSSE, outputStarted: true},
++			{name: "transport_reset", transportErr: syscall.ECONNRESET},
++			{name: "transport_eof", transportErr: io.EOF},
++			{name: "transport_timeout", transportErr: context.DeadlineExceeded},
++			{name: "stream_read_reset", status: 200, payload: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n", readErr: syscall.ECONNRESET},
++			{name: "stream_read_eof", status: 200, payload: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n", readErr: io.EOF},
++			{name: "stream_read_timeout", status: 200, payload: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n", readErr: context.DeadlineExceeded},
++		} {
++			t.Run(mode+"/"+tc.name, func(t *testing.T) {
++				cfg := &config.Config{RunMode: config.RunModeSimple}
++				cfg.Default.RateMultiplier = 1
++				cfg.Security.URLAllowlist.Enabled = false
++				cfg.Gateway.MaxAccountSwitches = 1
++				cfg.Gateway.OpenAIAPIKeyAvailabilityEnabled = true
++				accountRepo := &availabilityAccountRepo{&openAIWSFailoverHandlerAccountRepoStub{accounts: []service.Account{
++					{ID: 9910, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 1, Credentials: map[string]any{"api_key": "sk-fake-a", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": passthrough}},
++					{ID: 9911, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 2, Credentials: map[string]any{"api_key": "sk-fake-b", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": passthrough}},
++					{ID: 9912, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 3, Credentials: map[string]any{"api_key": "sk-fake-c", "base_url": "https://api.example.test"}, Extra: map[string]any{"openai_passthrough": passthrough}},
++				}}}
++				billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
++				t.Cleanup(billingCacheSvc.Stop)
++				rateLimitSvc := service.NewRateLimitService(accountRepo, nil, cfg, nil, nil)
++				upstream := &availabilityHTTPUpstream{failedStatus: tc.status, failedPayload: tc.payload, transportErr: tc.transportErr, readErr: tc.readErr, failSecond: tc.failSecond}
++				gatewaySvc := service.NewOpenAIGatewayService(accountRepo, nil, nil, nil, nil, nil, nil, cfg, nil, nil, service.NewBillingService(cfg, nil), rateLimitSvc, billingCacheSvc, upstream, &service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil)
++				h := NewOpenAIGatewayHandler(gatewaySvc, service.NewConcurrencyService(nil), billingCacheSvc, service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg), nil, nil, nil, nil, cfg)
++				groupID := int64(1903)
++				request := func() *httptest.ResponseRecorder {
++					recorder := httptest.NewRecorder()
++					c, _ := gin.CreateTestContext(recorder)
++					c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"hello","stream":true,"prompt_cache_key":"availability-regression"}`))
++					c.Request.Header.Set("Content-Type", "application/json")
++					c.Request.Header.Set("session_id", "availability-regression")
++					c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{ID: 1803, GroupID: &groupID, User: &service.User{ID: 1703, Status: service.StatusActive}, Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive}})
++					c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1703, Concurrency: 0})
++					h.Responses(c)
++					return recorder
++				}
++
++				first := request()
++				if tc.failSecond {
++					// A healthy third account exists, but the configured one-switch
++					// budget must end this request after A and B fail.
++					require.Equal(t, http.StatusBadGateway, first.Code, first.Body.String())
++					require.Equal(t, []int64{9910, 9911}, upstream.calls())
++					require.True(t, json.Valid(first.Body.Bytes()))
++					require.NotContains(t, first.Body.String(), "B answer")
++					return
++				}
++				require.Equal(t, http.StatusOK, first.Code, first.Body.String())
++				if tc.outputStarted {
++					// A's real text is already visible: replaying onto B would mix two answers.
++					require.Equal(t, []int64{9910}, upstream.calls())
++					require.Contains(t, first.Body.String(), "A partial")
++					require.NotContains(t, first.Body.String(), "B answer")
++					require.Equal(t, 0, availabilityEventCount(t, first.Body.String(), "response.completed"))
++					require.Equal(t, 1, availabilityEventCount(t, first.Body.String(), "response.failed"))
++				} else {
++					// Both upstream attempts belong to this one client request; A is not retried.
++					require.Equal(t, []int64{9910, 9911}, upstream.calls())
++					require.Contains(t, first.Body.String(), "B answer")
++					require.NotContains(t, first.Body.String(), "server_is_overloaded")
++					require.Equal(t, 1, availabilityEventCount(t, first.Body.String(), "response.completed"))
++					require.Equal(t, 0, availabilityEventCount(t, first.Body.String(), "response.failed"))
++				}
++
++				// Keep the same gateway and session. A still has the best priority, but its
++				// first upstream failure must keep it out of the next request.
++				before := len(upstream.calls())
++				second := request()
++				require.Equal(t, http.StatusOK, second.Code, second.Body.String())
++				require.Equal(t, []int64{9911}, upstream.calls()[before:])
++				require.Contains(t, second.Body.String(), "B answer")
++				require.NotContains(t, second.Body.String(), "A partial")
++				require.Equal(t, 1, availabilityEventCount(t, second.Body.String(), "response.completed"))
++			})
++		}
++	}
++}
+diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
+index 741379e63..4420c93b7 100644
+--- a/backend/internal/handler/openai_gateway_handler.go
++++ b/backend/internal/handler/openai_gateway_handler.go
+@@ -1625,6 +1625,9 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
+ }
+ 
+ func normalizeCodexDelegationBootstrap(body []byte) ([]byte, bool) {
++	if !hasCodexCallOutputBootstrapTool(body, "create_thread", "send_message_to_thread") {
++		return body, false
++	}
+ 	// 已有任务通过 send_message_to_thread 唤醒时会携带 previous_response_id；
+ 	// 完整历史回放还会带有已配对的调用项。delegation 仍是客户端注入的用户输入，
+ 	// 不属于这些历史调用的结果，因此允许它与可明确配对的历史上下文共存。
+@@ -1632,9 +1635,34 @@ func normalizeCodexDelegationBootstrap(body []byte) ([]byte, bool) {
+ }
+ 
+ func normalizeCodexAutomationBootstrap(body []byte) ([]byte, bool) {
++	if !hasCodexCallOutputBootstrapTool(body, "automation_update") {
++		return body, false
++	}
+ 	return normalizeCodexCallOutputBootstrap(body, isCodexAutomationCandidate, false)
+ }
+ 
++// Project only tool names from top-level input call outputs. Reading the whole
++// input with GetBytes, or decoding it into maps, copies large text/image bodies
++// even though ordinary Responses requests need no bootstrap normalization.
++// This is only a negative preflight: matching requests still pass through all
++// existing duplicate-key, envelope, namespace and historical-context checks.
++func hasCodexCallOutputBootstrapTool(body []byte, names ...string) bool {
++	found := false
++	gjson.GetBytes(body, `input.#(type=="function_call_output")#.name`).ForEach(func(_, value gjson.Result) bool {
++		if value.Type != gjson.String {
++			return true
++		}
++		for _, name := range names {
++			if value.Str == name {
++				found = true
++				return false
++			}
++		}
++		return true
++	})
++	return found
++}
++
+ func normalizeCodexCallOutputBootstrap(body []byte, isCandidate func(map[string]any) bool, allowHistoricalContext bool) ([]byte, bool) {
+ 	if !hasUniqueJSONMembers(body) {
+ 		return body, false
+diff --git a/backend/internal/repository/ops_availability_event_filter_test.go b/backend/internal/repository/ops_availability_event_filter_test.go
+new file mode 100644
+index 000000000..19d325aee
+--- /dev/null
++++ b/backend/internal/repository/ops_availability_event_filter_test.go
+@@ -0,0 +1,27 @@
++package repository
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++)
++
++func TestOpsAvailabilityEventFilterUsesExactBoundMessage(t *testing.T) {
++	for _, event := range []string{"openai.upstream_failover_switching", "event_%' OR TRUE --"} {
++		where, args, constrained := buildOpsSystemLogsWhere(&service.OpsSystemLogFilter{Event: event})
++		if !constrained || !strings.Contains(where, "l.message = $1") || len(args) != 1 || args[0] != event {
++			t.Fatalf("expected a bound exact event filter, got %q %#v", where, args)
++		}
++		if strings.Contains(where, event) || strings.Contains(where, "ILIKE") || strings.Contains(where, "extra::text") {
++			t.Fatalf("event counts must not match embedded payload text or SQL wildcards: %q", where)
++		}
++	}
++}
++
++func TestOpsAvailabilityEventFilterDoesNotChangeLegacySearch(t *testing.T) {
++	where, args, _ := buildOpsSystemLogsWhere(&service.OpsSystemLogFilter{Query: "upstream"})
++	if strings.Contains(where, "l.message =") || !strings.Contains(where, "l.message ILIKE") || len(args) != 1 || args[0] != "%upstream%" {
++		t.Fatalf("legacy text search changed: %q %#v", where, args)
++	}
++}
+diff --git a/backend/internal/repository/ops_repo.go b/backend/internal/repository/ops_repo.go
+index 56fec9a93..c049a2400 100644
+--- a/backend/internal/repository/ops_repo.go
++++ b/backend/internal/repository/ops_repo.go
+@@ -1081,6 +1081,11 @@ func buildOpsSystemLogsWhere(filter *service.OpsSystemLogFilter) (string, []any,
+ 		hasConstraint = true
+ 	}
+ 	if filter != nil {
++		if v := strings.TrimSpace(filter.Event); v != "" {
++			args = append(args, v)
++			clauses = append(clauses, "l.message = $"+itoa(len(args)))
++			hasConstraint = true
++		}
+ 		if v := strings.TrimSpace(filter.Host); v != "" {
+ 			args = append(args, v)
+ 			clauses = append(clauses, "l.host = $"+itoa(len(args)))
+diff --git a/backend/internal/service/openai_account_model_transient.go b/backend/internal/service/openai_account_model_transient.go
+index 60fcff905..7ecbb3198 100644
+--- a/backend/internal/service/openai_account_model_transient.go
++++ b/backend/internal/service/openai_account_model_transient.go
+@@ -77,6 +77,10 @@ func openAIAccountModelTransientKey(accountID int64, model string) (openAIAccoun
+ }
+ 
+ func (s *openAIAccountModelTransientState) recordFailure(accountID int64, model string, now time.Time) openAIAccountModelTransientDecision {
++	return s.recordFailureWithInitialCooldown(accountID, model, now, 0)
++}
++
++func (s *openAIAccountModelTransientState) recordFailureWithInitialCooldown(accountID int64, model string, now time.Time, initialCooldown time.Duration) openAIAccountModelTransientDecision {
+ 	key, ok := openAIAccountModelTransientKey(accountID, model)
+ 	if s == nil || !ok {
+ 		return openAIAccountModelTransientDecision{}
+@@ -108,7 +112,7 @@ func (s *openAIAccountModelTransientState) recordFailure(accountID int64, model
+ 	entry.lastFailure = now
+ 	entry.lastTouched = now
+ 
+-	cooldown := time.Duration(0)
++	cooldown := initialCooldown
+ 	switch {
+ 	case entry.failureStreak >= 3:
+ 		cooldown = openAIModelTransientLongCooldown
+diff --git a/backend/internal/service/openai_account_runtime_block_fastpath.go b/backend/internal/service/openai_account_runtime_block_fastpath.go
+index 3551d8ecb..454770d11 100644
+--- a/backend/internal/service/openai_account_runtime_block_fastpath.go
++++ b/backend/internal/service/openai_account_runtime_block_fastpath.go
+@@ -91,6 +91,26 @@ func isOpenAIAccount(account *Account) bool {
+ 	return account != nil && (account.Platform == PlatformOpenAI || account.Platform == PlatformGrok)
+ }
+ 
++func (s *OpenAIGatewayService) openAIAPIKeyAvailabilityEnabled(account *Account) bool {
++	return s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIAPIKeyAvailabilityEnabled &&
++		account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey &&
++		!account.IsPoolMode()
++}
++
++func openAIAPIKeyAvailabilityTransientStatus(statusCode int) bool {
++	switch statusCode {
++	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
++		http.StatusGatewayTimeout, 520, 521, 522, 523, 524:
++		return true
++	default:
++		return false
++	}
++}
++
++func (s *OpenAIGatewayService) openAIAPIKeyTransientAvailabilityEnabled(account *Account, statusCode int) bool {
++	return s.openAIAPIKeyAvailabilityEnabled(account) && openAIAPIKeyAvailabilityTransientStatus(statusCode)
++}
++
+ // handleOpenAIAccountUpstreamError expects canonicalModel to be the model used
+ // for scheduling after applying account mapping exactly once.
+ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, canonicalModel ...string) bool {
+@@ -101,9 +121,10 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
+ 	if s != nil {
+ 		scheduleOllamaCloudUsageActivity(s.deferredService, account)
+ 	}
+-	// Capacity shedding describes this request, not account health. Keep the
+-	// account schedulable while the request-local retry budget handles recovery.
+-	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) {
++	// Capacity shedding normally stays request-scoped. The opt-in API-key policy
++	// also records transient server failures against the selected account and model.
++	availabilityTransient := s.openAIAPIKeyTransientAvailabilityEnabled(account, statusCode)
++	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) && !availabilityTransient {
+ 		return false
+ 	}
+ 	stateCtx, cancel := openAIAccountStateContext(ctx)
+@@ -188,7 +209,11 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
+ 		if len(canonicalModel) > 0 {
+ 			model = canonicalModel[0]
+ 		}
+-		decision := s.recordOpenAIAccountModelTransientFailure(account, model, time.Now())
++		initialCooldown := time.Duration(0)
++		if availabilityTransient {
++			initialCooldown = openAIModelTransientShortCooldown
++		}
++		decision := s.recordOpenAIAccountModelTransientFailureWithInitialCooldown(account, model, time.Now(), initialCooldown)
+ 		if decision.FailureStreak > 0 {
+ 			slog.Warn("openai_model_transient_state",
+ 				"account_id", account.ID,
+@@ -443,6 +468,10 @@ func openAIAccountModelTransientModel(canonicalModel string) string {
+ }
+ 
+ func (s *OpenAIGatewayService) recordOpenAIAccountModelTransientFailure(account *Account, canonicalModel string, now time.Time) openAIAccountModelTransientDecision {
++	return s.recordOpenAIAccountModelTransientFailureWithInitialCooldown(account, canonicalModel, now, 0)
++}
++
++func (s *OpenAIGatewayService) recordOpenAIAccountModelTransientFailureWithInitialCooldown(account *Account, canonicalModel string, now time.Time, initialCooldown time.Duration) openAIAccountModelTransientDecision {
+ 	if s == nil || account == nil {
+ 		return openAIAccountModelTransientDecision{}
+ 	}
+@@ -450,7 +479,7 @@ func (s *OpenAIGatewayService) recordOpenAIAccountModelTransientFailure(account
+ 	if state == nil {
+ 		return openAIAccountModelTransientDecision{}
+ 	}
+-	return state.recordFailure(account.ID, openAIAccountModelTransientModel(canonicalModel), now)
++	return state.recordFailureWithInitialCooldown(account.ID, openAIAccountModelTransientModel(canonicalModel), now, initialCooldown)
+ }
+ 
+ func (s *OpenAIGatewayService) clearOpenAIAccountModelTransientState(accountID int64, model string) {
+diff --git a/backend/internal/service/openai_apikey_availability_latency_test.go b/backend/internal/service/openai_apikey_availability_latency_test.go
+new file mode 100644
+index 000000000..6d65d8d43
+--- /dev/null
++++ b/backend/internal/service/openai_apikey_availability_latency_test.go
+@@ -0,0 +1,160 @@
++package service
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sort"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/config"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++const availabilityLatencyText = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first real text\"}\n\n"
++const availabilityLatencyComplete = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"latency-test\",\"status\":\"completed\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
++
++type availabilityFirstTextRecorder struct {
++	*httptest.ResponseRecorder
++	started          time.Time
++	firstText        time.Duration
++	flushed          bool
++	firstTextFlushed chan struct{}
++}
++
++func (w *availabilityFirstTextRecorder) Flush() {
++	w.ResponseRecorder.Flush()
++	if !w.flushed && bytes.Contains(w.Body.Bytes(), []byte("first real text")) {
++		w.firstText = time.Since(w.started)
++		w.flushed = true
++		if w.firstTextFlushed != nil {
++			close(w.firstTextFlushed)
++		}
++	}
++}
++
++func newAvailabilityLatencyService(enabled bool) (*OpenAIGatewayService, *Account) {
++	cfg := &config.Config{Gateway: config.GatewayConfig{
++		MaxLineSize:                     defaultMaxLineSize,
++		OpenAIAPIKeyAvailabilityEnabled: enabled,
++	}}
++	return &OpenAIGatewayService{cfg: cfg}, &Account{
++		ID: 50701, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
++	}
++}
++
++func runAvailabilityLatencyStream(ctx context.Context, svc *OpenAIGatewayService, account *Account, passthrough bool, body io.ReadCloser, flushed chan struct{}) (*availabilityFirstTextRecorder, error) {
++	w := &availabilityFirstTextRecorder{ResponseRecorder: httptest.NewRecorder(), firstTextFlushed: flushed}
++	c, _ := gin.CreateTestContext(w)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
++	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body}
++	w.started = time.Now()
++	var err error
++	if passthrough {
++		_, err = svc.handleStreamingResponsePassthrough(ctx, resp, c, account, w.started, "gpt-test", "")
++	} else {
++		_, err = svc.handleStreamingResponse(ctx, resp, c, account, w.started, "gpt-test", "gpt-test")
++	}
++	return w, err
++}
++
++// The producer waits for an actual text flush before sending the terminal event.
++// Buffering the whole answer would deadlock until the test's cancellation guard.
++func TestOpenAIAPIKeyAvailabilityFirstTextBeforeCompletion(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, passthrough := range []bool{false, true} {
++		for _, enabled := range []bool{false, true} {
++			t.Run(fmt.Sprintf("passthrough=%t/enabled=%t", passthrough, enabled), func(t *testing.T) {
++				svc, account := newAvailabilityLatencyService(enabled)
++				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++				defer cancel()
++				r, p := io.Pipe()
++				defer func() { _ = r.Close() }()
++				flushed := make(chan struct{})
++				producer := make(chan error, 1)
++				go func() {
++					defer func() { _ = p.Close() }()
++					if _, err := io.WriteString(p, availabilityLatencyText); err != nil {
++						producer <- err
++						return
++					}
++					select {
++					case <-flushed:
++						_, err := io.WriteString(p, availabilityLatencyComplete)
++						producer <- err
++					case <-ctx.Done():
++						_ = p.CloseWithError(ctx.Err())
++						producer <- ctx.Err()
++					}
++				}()
++				w, err := runAvailabilityLatencyStream(ctx, svc, account, passthrough, r, flushed)
++				require.NoError(t, err)
++				require.NoError(t, <-producer)
++				require.True(t, w.flushed, "actual text must be flushed before the terminal event")
++				require.Equal(t, 1, strings.Count(w.Body.String(), "response.completed"))
++			})
++		}
++	}
++}
++
++// Measures parser-to-Flush latency with an immediately readable synthetic stream.
++// These figures exclude network, model generation, scheduling and client latency.
++func BenchmarkOpenAIAPIKeyAvailabilityFirstText(b *testing.B) {
++	gin.SetMode(gin.TestMode)
++	for _, passthrough := range []bool{false, true} {
++		for _, enabled := range []bool{false, true} {
++			b.Run(fmt.Sprintf("passthrough=%t/enabled=%t", passthrough, enabled), func(b *testing.B) {
++				svc, account := newAvailabilityLatencyService(enabled)
++				samples := make([]time.Duration, b.N)
++				b.ReportAllocs()
++				b.ResetTimer()
++				for i := 0; i < b.N; i++ {
++					body := io.NopCloser(strings.NewReader(availabilityLatencyText + availabilityLatencyComplete))
++					w, err := runAvailabilityLatencyStream(context.Background(), svc, account, passthrough, body, nil)
++					if err != nil || !w.flushed {
++						b.Fatalf("missing successful text flush: %v", err)
++					}
++					samples[i] = w.firstText
++				}
++				b.StopTimer()
++				sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
++				b.ReportMetric(float64(samples[(len(samples)-1)*50/100].Nanoseconds()), "first_text_p50_ns")
++				b.ReportMetric(float64(samples[(len(samples)-1)*95/100].Nanoseconds()), "first_text_p95_ns")
++			})
++		}
++	}
++}
++
++func BenchmarkOpenAIAPIKeyAvailabilityConcurrentStream(b *testing.B) {
++	gin.SetMode(gin.TestMode)
++	for _, passthrough := range []bool{false, true} {
++		for _, enabled := range []bool{false, true} {
++			b.Run(fmt.Sprintf("passthrough=%t/enabled=%t", passthrough, enabled), func(b *testing.B) {
++				svc, account := newAvailabilityLatencyService(enabled)
++				var elapsed atomic.Int64
++				b.SetParallelism(4)
++				b.ReportAllocs()
++				b.ResetTimer()
++				b.RunParallel(func(pb *testing.PB) {
++					for pb.Next() {
++						body := io.NopCloser(strings.NewReader(availabilityLatencyText + availabilityLatencyComplete))
++						w, err := runAvailabilityLatencyStream(context.Background(), svc, account, passthrough, body, nil)
++						if err != nil || !w.flushed {
++							b.Errorf("missing successful text flush: %v", err)
++							return
++						}
++						elapsed.Add(w.firstText.Nanoseconds())
++					}
++				})
++				b.ReportMetric(float64(elapsed.Load())/float64(b.N), "first_text_mean_ns")
++			})
++		}
++	}
++}
+diff --git a/backend/internal/service/openai_apikey_availability_test.go b/backend/internal/service/openai_apikey_availability_test.go
+new file mode 100644
+index 000000000..0da45e98a
+--- /dev/null
++++ b/backend/internal/service/openai_apikey_availability_test.go
+@@ -0,0 +1,399 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/config"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++type availabilityAccountRepo struct {
++	transientCooldownAccountRepo
++	rateLimitedUntil time.Time
++	authErrors       int
++}
++
++func (r *availabilityAccountRepo) SetRateLimited(_ context.Context, _ int64, until time.Time) error {
++	r.rateLimitedUntil = until
++	return nil
++}
++
++func (r *availabilityAccountRepo) SetError(context.Context, int64, string) error {
++	r.authErrors++
++	return nil
++}
++
++func newAPIKeyAvailabilityTestService(enabled bool) (*OpenAIGatewayService, *Account) {
++	cfg := &config.Config{Gateway: config.GatewayConfig{
++		OpenAIAPIKeyAvailabilityEnabled: enabled,
++		MaxLineSize:                     defaultMaxLineSize,
++	}}
++	svc := &OpenAIGatewayService{cfg: cfg}
++	svc.rateLimitService = NewRateLimitService(&availabilityAccountRepo{}, nil, cfg, nil, nil)
++	svc.rateLimitService.SetAccountRuntimeBlocker(svc)
++	return svc, &Account{ID: 50301, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
++}
++
++func apiKeyAvailabilityTransientEntry(t *testing.T, svc *OpenAIGatewayService, account *Account, model string) openAIAccountModelTransientEntry {
++	t.Helper()
++	state := svc.getOpenAIAccountModelTransientState()
++	key, ok := openAIAccountModelTransientKey(account.ID, model)
++	require.True(t, ok)
++	state.mu.Lock()
++	defer state.mu.Unlock()
++	entry, ok := state.entries[key]
++	require.True(t, ok, "transient failure must be recorded for this account and model")
++	return entry
++}
++
++func TestOpenAIAPIKeyAvailability_TransientStatusMatrix(t *testing.T) {
++	for _, status := range []int{500, 502, 503, 504, 520, 521, 522, 523, 524} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			body := []byte(`{"error":{"type":"server_error","message":"Upstream unavailable"}}`)
++			svc.handleOpenAIAccountUpstreamError(context.Background(), account, status, http.Header{}, body, "gpt-test")
++			entry := apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test")
++			require.Equal(t, 1, entry.failureStreak)
++			require.Equal(t, 10*time.Second, entry.blockUntil.Sub(entry.lastFailure))
++			require.False(t, svc.newOpenAIAccountFailoverError(account, status, nil, body, "", false, true).RetryableOnSameAccount)
++			for _, passthrough := range []bool{false, true} {
++				svc, account := newAPIKeyAvailabilityTestService(true)
++				body := fmt.Sprintf("data: {\"type\":\"error\",\"error\":{\"status_code\":%d,\"type\":\"server_error\",\"message\":\"Upstream unavailable\"}}\n\n", status)
++				rec, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, io.NopCloser(strings.NewReader(body)))
++				var failover *UpstreamFailoverError
++				require.ErrorAs(t, err, &failover)
++				require.Equal(t, status, failover.StatusCode)
++				require.False(t, failover.RetryableOnSameAccount)
++				require.Empty(t, rec.Body.String())
++				require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak)
++			}
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_StreamClassification(t *testing.T) {
++	svc, account := newAPIKeyAvailabilityTestService(true)
++	for _, tc := range []struct {
++		payload string
++		want    int
++	}{
++		{`{"type":"error","error":{"type":"server_error","message":"Failure"}}`, 500},
++		{`{"type":"error","error":{"code":"bad_gateway","message":"Failure"}}`, 502},
++		{`{"type":"error","error":{"code":"gateway_timeout","message":"Failure"}}`, 504},
++		{`{"type":"error","error":{"code":"unknown","message":"Failure"}}`, 0},
++		{`{"type":"error","error":{"type":"invalid_request_error","message":"Invalid input"}}`, 0},
++		{`{"type":"error","error":{"status_code":400,"message":"Invalid input"}}`, 0},
++		{`{"type":"error","error":{"status_code":400,"type":"server_error","message":"Invalid input"}}`, 0},
++		{"", 0},
++		{"not json", 0},
++	} {
++		t.Run(tc.payload, func(t *testing.T) {
++			require.Equal(t, tc.want, svc.openAIAPIKeyTransientStreamStatus(account, []byte(tc.payload), extractOpenAISSEErrorMessage([]byte(tc.payload))))
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_RateLimitRetryAfter(t *testing.T) {
++	for _, tc := range []struct {
++		name, retryAfter string
++		quota            bool
++		minimum, maximum time.Duration
++	}{
++		{"seconds", "90", false, 89 * time.Second, 91 * time.Second},
++		{"HTTP date", time.Now().Add(2 * time.Minute).UTC().Format(http.TimeFormat), false, 118 * time.Second, 121 * time.Second},
++		{"longer quota reset wins", "10", true, 298 * time.Second, 301 * time.Second},
++		{"bounded hint", "172800", false, 23*time.Hour + 59*time.Minute, 24*time.Hour + time.Second},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			repo, ok := svc.rateLimitService.accountRepo.(*availabilityAccountRepo)
++			require.True(t, ok)
++			body := []byte(`{"error":{"code":"rate_limit_exceeded","message":"Rate limited"}}`)
++			if tc.quota {
++				body = []byte(fmt.Sprintf(`{"error":{"type":"usage_limit_reached","resets_at":%d}}`, time.Now().Add(5*time.Minute).Unix()))
++			}
++			headers := http.Header{"Retry-After": {tc.retryAfter}}
++			svc.handleOpenAIAccountUpstreamError(context.Background(), account, 429, headers, body, "gpt-test")
++			remaining := time.Until(repo.rateLimitedUntil)
++			require.GreaterOrEqual(t, remaining, tc.minimum)
++			require.LessOrEqual(t, remaining, tc.maximum)
++			require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
++			require.False(t, svc.newOpenAIAccountFailoverError(account, 429, headers, body, "", false, true).RetryableOnSameAccount)
++		})
++	}
++	for _, enabled := range []bool{false, true} {
++		svc, account := newAPIKeyAvailabilityTestService(enabled)
++		body := []byte(`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limited"}}}`)
++		c, _ := gin.CreateTestContext(httptest.NewRecorder())
++		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
++		svc.handleOpenAIStreamTerminalAccountSideEffects(c, account, body, "Rate limited", http.Header{"Retry-After": {"90"}}, "gpt-test")
++		repo, ok := svc.rateLimitService.accountRepo.(*availabilityAccountRepo)
++		require.True(t, ok)
++		if enabled {
++			require.Greater(t, time.Until(repo.rateLimitedUntil), 89*time.Second)
++		} else {
++			require.Less(t, time.Until(repo.rateLimitedUntil), 89*time.Second)
++		}
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_CredentialFailuresStayNarrow(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		status int
++		body   string
++		want   bool
++	}{
++		{"401 structured authentication", 401, `{"error":{"message":"Invalid credentials"}}`, true},
++		{"403 invalid key", 403, `{"error":{"code":"invalid_api_key","message":"Invalid API key"}}`, true},
++		{"403 disabled account", 403, `{"error":{"code":"account_disabled","message":"Disabled"}}`, true},
++		{"403 permission", 403, `{"error":{"type":"permission_error","message":"Not permitted for this model"}}`, false},
++		{"403 HTML", 403, `<html>Forbidden</html>`, false},
++		{"400 parameter", 400, `{"error":{"type":"invalid_request_error","message":"Invalid input"}}`, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			require.Equal(t, tc.want, svc.openAIAPIKeyCredentialFailure(account, tc.status, []byte(tc.body)))
++			if tc.want {
++				require.True(t, svc.handleOpenAIAccountUpstreamError(context.Background(), account, tc.status, nil, []byte(tc.body), "gpt-test"))
++				require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
++				require.False(t, svc.newOpenAIAccountFailoverError(account, tc.status, nil, []byte(tc.body), "", true, true).RetryableOnSameAccount)
++			}
++			svc.cfg.Gateway.OpenAIAPIKeyAvailabilityEnabled = false
++			require.False(t, svc.openAIAPIKeyCredentialFailure(account, tc.status, []byte(tc.body)))
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_HTTPPolicyAndSuccess(t *testing.T) {
++	for _, body := range []string{
++		`{"error":{"message":"temporary upstream failure"}}`,
++		`{"error":{"code":"server_is_overloaded","message":"Please retry later."}}`,
++	} {
++		t.Run(body, func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream-a", "upstream-a": "upstream-b"}}
++			for i, cooldown := range []time.Duration{10 * time.Second, 10 * time.Second, 45 * time.Second} {
++				disabled := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusServiceUnavailable, http.Header{}, []byte(body), "upstream-a")
++				require.False(t, disabled)
++				entry := apiKeyAvailabilityTransientEntry(t, svc, account, "upstream-a")
++				require.Equal(t, i+1, entry.failureStreak)
++				require.Equal(t, cooldown, entry.blockUntil.Sub(entry.lastFailure))
++				require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++				require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "other-model"))
++				require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
++				failover := svc.newOpenAIAccountFailoverError(account, http.StatusServiceUnavailable, http.Header{}, []byte(body), "", false, true)
++				require.False(t, failover.RetryableOnSameAccount)
++			}
++			svc.ReportOpenAIAccountScheduleResult(account, "upstream-a", true, nil)
++			require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++			svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusServiceUnavailable, http.Header{}, []byte(body), "upstream-a")
++			require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "upstream-a").failureStreak)
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_LegacyAndAccountScope(t *testing.T) {
++	for _, tc := range []struct {
++		name                  string
++		enabled               bool
++		accountType, platform string
++		pool                  bool
++	}{
++		{name: "flag off", accountType: AccountTypeAPIKey, platform: PlatformOpenAI},
++		{name: "OAuth", enabled: true, accountType: AccountTypeOAuth, platform: PlatformOpenAI},
++		{name: "pool API key", enabled: true, accountType: AccountTypeAPIKey, platform: PlatformOpenAI, pool: true},
++		{name: "other platform", enabled: true, accountType: AccountTypeAPIKey, platform: PlatformGrok},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(tc.enabled)
++			account.Type, account.Platform = tc.accountType, tc.platform
++			account.Credentials = map[string]any{"pool_mode": tc.pool}
++			require.False(t, svc.openAIAPIKeyTransientAvailabilityEnabled(account, 503))
++			if account.Platform != PlatformOpenAI {
++				return
++			}
++			body := []byte(`{"error":{"code":"server_is_overloaded","message":"Please retry later."}}`)
++			for range 3 {
++				svc.handleOpenAIAccountUpstreamError(context.Background(), account, 503, http.Header{}, body, "gpt-test")
++			}
++			require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++			failover := svc.newOpenAIAccountFailoverError(account, 503, http.Header{}, body, "", false, false)
++			require.True(t, failover.RetryableOnSameAccount)
++		})
++	}
++	t.Run("ordinary legacy 503 first failure remains schedulable", func(t *testing.T) {
++		svc, account := newAPIKeyAvailabilityTestService(false)
++		svc.handleOpenAIAccountUpstreamError(context.Background(), account, 503, http.Header{}, []byte(`{"error":{"message":"upstream unavailable"}}`), "gpt-test")
++		require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++		require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak)
++	})
++	t.Run("parameter 400 stays schedulable", func(t *testing.T) {
++		svc, account := newAPIKeyAvailabilityTestService(true)
++		for range 3 {
++			svc.handleOpenAIAccountUpstreamError(context.Background(), account, 400, http.Header{}, []byte(`{"error":{"type":"invalid_request_error","message":"Invalid type for input[0].arguments"}}`), "gpt-test")
++		}
++		require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
++	})
++}
++
++func runAPIKeyAvailabilityTestStream(t *testing.T, svc *OpenAIGatewayService, account *Account, passthrough bool, body io.ReadCloser) (*httptest.ResponseRecorder, error) {
++	t.Helper()
++	gin.SetMode(gin.TestMode)
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body}
++	var err error
++	if passthrough {
++		// The real passthrough forwarder passes an empty mapped model for ordinary
++		// requests. Only compact fallback fills it, unlike the native reader.
++		_, err = svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "gpt-test", "")
++	} else {
++		_, err = svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "gpt-test", "gpt-test")
++	}
++	return rec, err
++}
++
++func TestOpenAIAPIKeyAvailability_StreamBeforeOutput(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		for _, payload := range []string{
++			`{"type":"response.failed","response":{"error":{"type":"server_error","code":"server_is_overloaded","message":"The server is overloaded"}}}`,
++			`{"type":"error","status_code":503,"error":{"message":"Upstream unavailable"}}`,
++		} {
++			t.Run(payload+map[bool]string{false: "/native", true: "/passthrough"}[passthrough], func(t *testing.T) {
++				svc, account := newAPIKeyAvailabilityTestService(true)
++				body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n" + "data: " + payload + "\n\n"
++				rec, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, io.NopCloser(strings.NewReader(body)))
++				var failover *UpstreamFailoverError
++				require.ErrorAs(t, err, &failover)
++				require.Equal(t, 503, failover.StatusCode)
++				require.False(t, failover.RetryableOnSameAccount)
++				require.Empty(t, rec.Body.String(), "failed attempt must not commit preamble or error")
++				require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak)
++				require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++			})
++		}
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_ExplicitStream503KeepsRequestRejections(t *testing.T) {
++	svc, account := newAPIKeyAvailabilityTestService(true)
++	for _, payload := range []string{
++		`{"type":"error","status_code":503,"error":{"code":"content_policy","message":"Request blocked by policy"}}`,
++		`{"type":"error","status_code":503,"error":{"type":"invalid_request_error","message":"Invalid input"}}`,
++		`{"type":"response.failed","response":{"error":{"status_code":503,"code":"cyber_policy","message":"flagged for cyber policy"}}}`,
++	} {
++		t.Run(payload, func(t *testing.T) {
++			require.False(t, svc.isOpenAIAPIKeyTransientStreamFailure(account, []byte(payload), extractOpenAISSEErrorMessage([]byte(payload))))
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_NonStreamingPassthroughTerminal(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(map[bool]string{false: "legacy", true: "enabled"}[enabled], func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(enabled)
++			account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "gpt-test", "gpt-test": "must-not-map-twice"}}
++			gin.SetMode(gin.TestMode)
++			rec := httptest.NewRecorder()
++			c, _ := gin.CreateTestContext(rec)
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++			body := []byte("data: {\"type\":\"error\",\"status_code\":503,\"error\":{\"type\":\"server_error\",\"message\":\"Upstream unavailable\"}}\n\n")
++			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}
++			_, err := svc.handlePassthroughSSEToJSON(resp, c, account, body, "alias", "")
++			require.Error(t, err)
++			var failover *UpstreamFailoverError
++			require.Equal(t, enabled, errors.As(err, &failover))
++			if enabled {
++				require.Equal(t, 503, failover.StatusCode)
++				require.False(t, failover.RetryableOnSameAccount)
++				require.Empty(t, rec.Body.String())
++				require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++				require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak)
++			} else {
++				require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++			}
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_StreamLegacyAndCancellation(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		path := map[bool]string{false: "native", true: "passthrough"}[passthrough]
++		for _, tc := range []struct {
++			name          string
++			enabled, pool bool
++			accountType   string
++		}{
++			{name: "flag off", accountType: AccountTypeAPIKey},
++			{name: "OAuth", enabled: true, accountType: AccountTypeOAuth},
++			{name: "pool", enabled: true, pool: true, accountType: AccountTypeAPIKey},
++		} {
++			t.Run(path+"/"+tc.name, func(t *testing.T) {
++				svc, account := newAPIKeyAvailabilityTestService(tc.enabled)
++				account.Type = tc.accountType
++				account.Credentials = map[string]any{"pool_mode": tc.pool}
++				body := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Please retry later.\"}}}\n\n"
++				rec, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, io.NopCloser(strings.NewReader(body)))
++				var failover *UpstreamFailoverError
++				require.ErrorAs(t, err, &failover)
++				require.True(t, failover.RetryableOnSameAccount)
++				require.Empty(t, rec.Body.String())
++				require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++			})
++		}
++		t.Run(path+"/client cancellation", func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			body := &passthroughFlushTestErrorBody{payload: []byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"cancelled\"}}\n\n"), err: context.Canceled}
++			_, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, body)
++			require.ErrorIs(t, err, context.Canceled)
++			require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_StreamAfterOutputDeduplicatesAndNeverReplays(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		t.Run(map[bool]string{false: "native", true: "passthrough"}[passthrough], func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"real answer\"}\n\n" +
++				"data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Please retry later.\"}}\n\n" +
++				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Please retry later.\"}}}\n\n"
++			rec, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, io.NopCloser(strings.NewReader(body)))
++			require.Error(t, err)
++			var failover *UpstreamFailoverError
++			require.False(t, errors.As(err, &failover), "already committed content must not be replayed")
++			require.Equal(t, 1, strings.Count(rec.Body.String(), "real answer"))
++			require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak, "error plus failed is one failed attempt")
++			require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-test"))
++		})
++	}
++}
++
++func TestOpenAIAPIKeyAvailability_ToolArgumentsPreventReplay(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		t.Run(map[bool]string{false: "native", true: "passthrough"}[passthrough], func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			body := "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_test\",\"type\":\"function_call\",\"call_id\":\"call_test\",\"name\":\"search\",\"arguments\":\"\"}}\n\n" +
++				"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_test\",\"output_index\":0,\"delta\":\"{\\\"query\\\":\\\"hello\\\"}\"}\n\n" +
++				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Please retry later.\"}}}\n\n"
++			rec, err := runAPIKeyAvailabilityTestStream(t, svc, account, passthrough, io.NopCloser(strings.NewReader(body)))
++			require.Error(t, err)
++			var failover *UpstreamFailoverError
++			require.False(t, errors.As(err, &failover), "committed tool arguments must not be replayed")
++			require.Equal(t, 1, strings.Count(rec.Body.String(), "response.function_call_arguments.delta"))
++			require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "gpt-test").failureStreak)
++		})
++	}
++}
+diff --git a/backend/internal/service/openai_availability_transport.go b/backend/internal/service/openai_availability_transport.go
+new file mode 100644
+index 000000000..ce46c17d4
+--- /dev/null
++++ b/backend/internal/service/openai_availability_transport.go
+@@ -0,0 +1,54 @@
++package service
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"log/slog"
++	"time"
++
++	"github.com/gin-gonic/gin"
++)
++
++func openAIAvailabilityCallerGone(ctx context.Context, c *gin.Context, err error) bool {
++	return errors.Is(err, context.Canceled) || (ctx != nil && ctx.Err() != nil) ||
++		(c != nil && c.Request != nil && c.Request.Context().Err() != nil)
++}
++
++func openAIAvailabilityModel(account *Account, originalModel, mappedModel string) string {
++	if mappedModel != "" {
++		return mappedModel
++	}
++	return canonicalOpenAIAccountSchedulingModel(account, originalModel)
++}
++
++func (s *OpenAIGatewayService) openAIAvailabilityReadFailure(ctx context.Context, c *gin.Context, account *Account, err error) bool {
++	return s.openAIAPIKeyAvailabilityEnabled(account) && err != nil &&
++		!openAIAvailabilityCallerGone(ctx, c, err) && !errors.Is(err, bufio.ErrTooLong) &&
++		!errors.Is(err, ErrUpstreamResponseBodyTooLarge)
++}
++
++// Called only for observed upstream I/O failures, never for local staging,
++// response size limits, parameter validation, or downstream cancellation.
++func (s *OpenAIGatewayService) recordOpenAIAvailabilityTransportFailure(ctx context.Context, c *gin.Context, account *Account, model string, err error) {
++	if !s.openAIAvailabilityReadFailure(ctx, c, account, err) {
++		return
++	}
++	decision := s.recordOpenAIAccountModelTransientFailureWithInitialCooldown(account, model, time.Now(), openAIModelTransientShortCooldown)
++	if decision.FailureStreak > 0 {
++		slog.Warn("openai_model_transient_state", "account_id", account.ID,
++			"model", openAIAccountModelTransientModel(model), "failure_streak", decision.FailureStreak,
++			"cooldown_ms", decision.Cooldown.Milliseconds(), "block_scope", "account_model", "cause", "upstream_transport")
++	}
++}
++
++func (s *OpenAIGatewayService) newOpenAIAvailabilityStreamTransportError(ctx context.Context, c *gin.Context, account *Account, passthrough bool, requestID, model, message string, cause error) error {
++	if s.openAIAPIKeyAvailabilityEnabled(account) && openAIAvailabilityCallerGone(ctx, c, cause) {
++		if ctx != nil && ctx.Err() != nil {
++			return ctx.Err()
++		}
++		return cause
++	}
++	s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, model, cause)
++	return s.newOpenAIStreamFailoverErrorWithModel(c, account, passthrough, requestID, nil, message, model)
++}
+diff --git a/backend/internal/service/openai_availability_transport_test.go b/backend/internal/service/openai_availability_transport_test.go
+new file mode 100644
+index 000000000..280dbf8ea
+--- /dev/null
++++ b/backend/internal/service/openai_availability_transport_test.go
+@@ -0,0 +1,301 @@
++package service
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++const availabilityIOPreamble = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n"
++const availabilityIOText = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"real text\"}\n\n"
++const availabilityIOComplete = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
++
++type availabilityTimeoutSettingsSpy struct {
++	SettingRepository
++	value string
++	calls atomic.Int64
++}
++
++func (s *availabilityTimeoutSettingsSpy) GetValue(_ context.Context, key string) (string, error) {
++	if key != SettingKeyStreamTimeoutSettings {
++		return "", ErrSettingNotFound
++	}
++	s.calls.Add(1)
++	return s.value, nil
++}
++
++type availabilityTimeoutCounterSpy struct {
++	TimeoutCounterCache
++	increments atomic.Int64
++	resets     atomic.Int64
++}
++
++func (s *availabilityTimeoutCounterSpy) IncrementTimeoutCount(context.Context, int64, int) (int64, error) {
++	return s.increments.Add(1), nil
++}
++
++func (s *availabilityTimeoutCounterSpy) ResetTimeoutCount(context.Context, int64) error {
++	s.resets.Add(1)
++	return nil
++}
++
++func installAvailabilityTimeoutPolicy(t *testing.T, svc *OpenAIGatewayService, threshold int) (*availabilityTimeoutSettingsSpy, *availabilityTimeoutCounterSpy) {
++	t.Helper()
++	value, err := json.Marshal(StreamTimeoutSettings{
++		Enabled: true, Action: StreamTimeoutActionError,
++		ThresholdCount: threshold, ThresholdWindowMinutes: 5, TempUnschedMinutes: 1,
++	})
++	require.NoError(t, err)
++	settings := &availabilityTimeoutSettingsSpy{value: string(value)}
++	counter := &availabilityTimeoutCounterSpy{}
++	svc.rateLimitService.SetSettingService(&SettingService{settingRepo: settings})
++	svc.rateLimitService.SetTimeoutCounterCache(counter)
++	return settings, counter
++}
++
++func runAvailabilityIOStream(t *testing.T, svc *OpenAIGatewayService, account *Account, ctx context.Context, passthrough bool, body io.ReadCloser) (*httptest.ResponseRecorder, error) {
++	t.Helper()
++	gin.SetMode(gin.TestMode)
++	w := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(w)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
++	resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body}
++	var err error
++	if passthrough {
++		_, err = svc.handleStreamingResponsePassthrough(ctx, resp, c, account, time.Now(), "alias", "")
++	} else {
++		_, err = svc.handleStreamingResponse(ctx, resp, c, account, time.Now(), "alias", "upstream")
++	}
++	return w, err
++}
++
++func TestOpenAIAvailabilityIOFailures(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		for _, cause := range []error{io.EOF, io.ErrUnexpectedEOF, context.DeadlineExceeded, syscall.ECONNRESET} {
++			for _, stage := range []string{"preamble", "text", "completed"} {
++				name := map[bool]string{false: "native/", true: "passthrough/"}[passthrough] + stage + "/" + cause.Error()
++				t.Run(name, func(t *testing.T) {
++					svc, account := newAPIKeyAvailabilityTestService(true)
++					account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
++					payload := availabilityIOPreamble
++					if stage != "preamble" {
++						payload += availabilityIOText
++					}
++					if stage == "completed" {
++						payload += availabilityIOComplete
++					}
++					body := &openAIStreamReadThenErrorCloser{reader: strings.NewReader(payload), err: cause}
++					w, err := runAvailabilityIOStream(t, svc, account, context.Background(), passthrough, body)
++					if stage == "completed" {
++						require.NoError(t, err)
++						require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++						return
++					}
++					require.Error(t, err)
++					var failover *UpstreamFailoverError
++					require.Equal(t, stage == "preamble", errors.As(err, &failover))
++					if stage == "preamble" {
++						require.Empty(t, w.Body.String())
++						require.False(t, failover.RetryableOnSameAccount)
++					} else {
++						require.Equal(t, 1, strings.Count(w.Body.String(), "real text"))
++					}
++					require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "upstream").failureStreak)
++					require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++					require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "other"))
++				})
++			}
++		}
++	}
++}
++
++func TestOpenAIAvailabilityIOCancellationAndLimits(t *testing.T) {
++	for _, cause := range []error{context.Canceled, io.ErrUnexpectedEOF, context.DeadlineExceeded, ErrUpstreamResponseBodyTooLarge} {
++		for _, parentCanceled := range []bool{false, true} {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			ctx, cancel := context.WithCancel(context.Background())
++			if parentCanceled {
++				cancel()
++			}
++			svc.recordOpenAIAvailabilityTransportFailure(ctx, nil, account, "model", cause)
++			want := !parentCanceled && cause != context.Canceled && cause != ErrUpstreamResponseBodyTooLarge
++			require.Equal(t, want, svc.isOpenAIAccountModelRuntimeBlocked(account, "model"))
++			cancel()
++		}
++	}
++	for _, passthrough := range []bool{false, true} {
++		for _, cause := range []error{io.EOF, io.ErrUnexpectedEOF, context.DeadlineExceeded, syscall.ECONNRESET} {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
++			ctx, cancel := context.WithCancel(context.Background())
++			cancel()
++			_, err := runAvailabilityIOStream(t, svc, account, ctx, passthrough, &openAIStreamReadThenErrorCloser{reader: strings.NewReader(availabilityIOPreamble), err: cause})
++			var failover *UpstreamFailoverError
++			require.False(t, errors.As(err, &failover))
++			require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++		}
++	}
++}
++
++func TestOpenAIAvailabilityNonStreamingReadFailure(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		svc, account := newAPIKeyAvailabilityTestService(true)
++		account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
++		w := httptest.NewRecorder()
++		c, _ := gin.CreateTestContext(w)
++		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++		resp := &http.Response{StatusCode: 200, Header: http.Header{}, Body: &openAIStreamReadThenErrorCloser{reader: strings.NewReader(`{"id":`), err: io.ErrUnexpectedEOF}}
++		var err error
++		if passthrough {
++			_, err = svc.handleNonStreamingResponsePassthrough(c.Request.Context(), resp, c, account, "alias", "")
++		} else {
++			_, err = svc.handleNonStreamingResponse(c.Request.Context(), resp, c, account, "alias", "upstream")
++		}
++		var failover *UpstreamFailoverError
++		require.ErrorAs(t, err, &failover)
++		require.Empty(t, w.Body.String())
++		require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "upstream").failureStreak)
++	}
++}
++
++func TestOpenAIAvailabilityNonStreamingReadFailureAfterCompactKeepalive(t *testing.T) {
++	for _, passthrough := range []bool{false, true} {
++		t.Run(map[bool]string{false: "native", true: "passthrough"}[passthrough], func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
++			c, recorder := newCompactBridgeTestContext(t, true)
++			stop := StartOpenAICompactSSEKeepalive(c, keepaliveTestInterval)
++			defer stop()
++			waitForKeepaliveBeats()
++			require.True(t, StopOpenAICompactSSEKeepaliveCommitted(c))
++			require.True(t, c.Writer.Written())
++			require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c))
++			before := recorder.Body.String()
++			require.Contains(t, before, ": keepalive\n\n")
++			resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}},
++				Body: &openAIStreamReadThenErrorCloser{reader: strings.NewReader(`{"id":`), err: io.ErrUnexpectedEOF}}
++			var err error
++			if passthrough {
++				_, err = svc.handleNonStreamingResponsePassthrough(c.Request.Context(), resp, c, account, "alias", "")
++			} else {
++				_, err = svc.handleNonStreamingResponse(c.Request.Context(), resp, c, account, "alias", "upstream")
++			}
++			var failover *UpstreamFailoverError
++			require.ErrorAs(t, err, &failover, "keepalive bytes must not prevent next-account failover")
++			require.False(t, failover.RetryableOnSameAccount)
++			require.Equal(t, before, recorder.Body.String(), "failed attempt must add no error or response body")
++			require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "upstream").failureStreak)
++			require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "alias"))
++		})
++	}
++}
++
++func TestOpenAIAvailabilityFirstOutputTimeoutDoesNotPunishCancellation(t *testing.T) {
++	for _, cancellation := range []string{"request", "forward"} {
++		t.Run(cancellation, func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			settings, counter := installAvailabilityTimeoutPolicy(t, svc, 1)
++			repo, ok := svc.rateLimitService.accountRepo.(*availabilityAccountRepo)
++			require.True(t, ok)
++			c, _ := gin.CreateTestContext(httptest.NewRecorder())
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++			cancelled, cancel := context.WithCancel(context.Background())
++			cancel()
++			forwardCtx := context.Background()
++			if cancellation == "request" {
++				c.Request = c.Request.WithContext(cancelled)
++			} else {
++				forwardCtx = cancelled
++			}
++			err := svc.newOpenAIFirstOutputTimeoutError(forwardCtx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account), time.Now(), "model", "", 30*time.Second, "semantic_output", nil)
++			require.Error(t, err)
++			require.Zero(t, settings.calls.Load(), "cancelled caller must not invoke administrator timeout policy")
++			require.Zero(t, counter.increments.Load())
++			require.Zero(t, counter.resets.Load())
++			require.Zero(t, repo.authErrors)
++			require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
++			require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "model"))
++		})
++	}
++	t.Run("live caller still reaches enabled policy", func(t *testing.T) {
++		svc, account := newAPIKeyAvailabilityTestService(true)
++		settings, counter := installAvailabilityTimeoutPolicy(t, svc, 1)
++		c, _ := gin.CreateTestContext(httptest.NewRecorder())
++		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++		err := svc.newOpenAIFirstOutputTimeoutError(c.Request.Context(), c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account), time.Now(), "model", "", 30*time.Second, "semantic_output", nil)
++		require.Error(t, err)
++		require.EqualValues(t, 1, settings.calls.Load())
++		require.EqualValues(t, 1, counter.increments.Load())
++		require.EqualValues(t, 1, counter.resets.Load())
++		repo, ok := svc.rateLimitService.accountRepo.(*availabilityAccountRepo)
++		require.True(t, ok)
++		require.Equal(t, 1, repo.authErrors)
++	})
++}
++
++func TestOpenAIAvailabilityFirstOutputTimeoutUsesActualCanonicalModel(t *testing.T) {
++	svc, account := newAPIKeyAvailabilityTestService(true)
++	account.Credentials = map[string]any{"model_mapping": map[string]any{"A": "C", "B": "D"}}
++	c, _ := gin.CreateTestContext(httptest.NewRecorder())
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++	err := svc.newOpenAIFirstOutputTimeoutError(c.Request.Context(), c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account), time.Now(), "A", "", 30*time.Second, "semantic_output", nil, "B")
++	require.Error(t, err)
++	state := svc.getOpenAIAccountModelTransientState()
++	require.True(t, state.isBlocked(account.ID, "B", time.Now()))
++	for _, unaffected := range []string{"A", "C", "D"} {
++		require.False(t, state.isBlocked(account.ID, unaffected, time.Now()), "must cool only the actual upstream model")
++	}
++	require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "B").failureStreak)
++	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
++}
++
++func TestOpenAIAvailabilityConfiguredTimeouts(t *testing.T) {
++	t.Run("first output", func(t *testing.T) {
++		svc, account := newAPIKeyAvailabilityTestService(true)
++		w := httptest.NewRecorder()
++		c, _ := gin.CreateTestContext(w)
++		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++		err := svc.newOpenAIFirstOutputTimeoutError(c.Request.Context(), c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account), time.Now(), "model", "", 30*time.Second, "response_headers", http.Header{})
++		require.True(t, err.SafeToFailoverAfterWrite)
++		require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "model"))
++	})
++	for _, textStarted := range []bool{false, true} {
++		t.Run(map[bool]string{false: "idle before output", true: "idle after output"}[textStarted], func(t *testing.T) {
++			svc, account := newAPIKeyAvailabilityTestService(true)
++			settings, counter := installAvailabilityTimeoutPolicy(t, svc, 2)
++			svc.cfg.Gateway.StreamDataIntervalTimeout = 1
++			account.Credentials = map[string]any{"model_mapping": map[string]any{"alias": "upstream"}}
++			r, w := io.Pipe()
++			t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
++			go func() {
++				payload := availabilityIOPreamble
++				if textStarted {
++					payload += availabilityIOText
++				}
++				_, _ = io.WriteString(w, payload)
++			}()
++			_, err := runAvailabilityIOStream(t, svc, account, context.Background(), false, r)
++			var failover *UpstreamFailoverError
++			require.Error(t, err)
++			require.Equal(t, !textStarted, errors.As(err, &failover))
++			require.Equal(t, 1, apiKeyAvailabilityTransientEntry(t, svc, account, "upstream").failureStreak)
++			require.EqualValues(t, 1, settings.calls.Load(), "native idle failover must preserve administrator policy")
++			require.EqualValues(t, 1, counter.increments.Load())
++			require.Zero(t, counter.resets.Load(), "threshold has not been reached")
++			repo, ok := svc.rateLimitService.accountRepo.(*availabilityAccountRepo)
++			require.True(t, ok)
++			require.Zero(t, repo.authErrors)
++		})
++	}
++}
+diff --git a/backend/internal/service/openai_first_output_timeout.go b/backend/internal/service/openai_first_output_timeout.go
+index 3b47fdd7d..cef28b4cf 100644
+--- a/backend/internal/service/openai_first_output_timeout.go
++++ b/backend/internal/service/openai_first_output_timeout.go
+@@ -259,6 +259,7 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
+ 	timeout time.Duration,
+ 	phase string,
+ 	responseHeaders http.Header,
++	canonicalModel ...string,
+ ) *UpstreamFailoverError {
+ 	elapsed := time.Since(startTime)
+ 	logger.LegacyPrintf(
+@@ -275,8 +276,15 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
+ 		Kind: "first_output_timeout", Message: "OpenAI upstream produced no semantic output before the deadline",
+ 		Detail: fmt.Sprintf("phase=%s elapsed_ms=%d timeout_ms=%d", phase, elapsed.Milliseconds(), timeout.Milliseconds()),
+ 	})
+-	if s.rateLimitService != nil {
+-		s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
++	if !s.openAIAPIKeyAvailabilityEnabled(account) || !openAIAvailabilityCallerGone(ctx, c, nil) {
++		if s.rateLimitService != nil {
++			s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
++		}
++		model := canonicalOpenAIAccountSchedulingModel(account, originalModel)
++		if len(canonicalModel) > 0 && strings.TrimSpace(canonicalModel[0]) != "" {
++			model = canonicalModel[0]
++		}
++		s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, model, context.DeadlineExceeded)
+ 	}
+ 	return &UpstreamFailoverError{
+ 		StatusCode:      http.StatusGatewayTimeout,
+diff --git a/backend/internal/service/openai_gateway_forward.go b/backend/internal/service/openai_gateway_forward.go
+index 6837cb823..07067bd7d 100644
+--- a/backend/internal/service/openai_gateway_forward.go
++++ b/backend/internal/service/openai_gateway_forward.go
+@@ -1054,7 +1054,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			return nil, s.newOpenAIFirstOutputTimeoutError(
+ 				ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+ 				startTime, originalModel, reasoningEffortValue,
+-				firstOutputTimeout, "response_headers", nil,
++				firstOutputTimeout, "response_headers", nil, upstreamModel,
+ 			)
+ 		}
+ 		if err != nil {
+@@ -1067,7 +1067,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
+ 			// a failover so the handler switches to a healthy account, and temporarily
+ 			// unschedule the account on durable faults (e.g. rejected proxy credentials).
+-			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
++			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false, upstreamModel)
+ 		}
+ 		if headerGuard != nil {
+ 			resp.Body = &openAIRequestContextReadCloser{ReadCloser: resp.Body, cleanup: headerGuard.close}
+diff --git a/backend/internal/service/openai_gateway_passthrough.go b/backend/internal/service/openai_gateway_passthrough.go
+index dfebb47a5..2fc66c2b3 100644
+--- a/backend/internal/service/openai_gateway_passthrough.go
++++ b/backend/internal/service/openai_gateway_passthrough.go
+@@ -379,7 +379,10 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 		if err != nil {
+ 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
+ 			// a failover so the handler switches to a healthy account.
+-			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
++			if resp != nil && resp.Body != nil {
++				_ = resp.Body.Close()
++			}
++			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true, openAIAvailabilityModel(account, requestedModel, upstreamPassthroughModel))
+ 		}
+ 		if resp.StatusCode >= 400 {
+ 			// Peek only to identify an invalid task. Restore the body so the existing
+@@ -423,7 +426,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 			// 透传模式默认保持原样代理；容量错误以及 API-key 上游的瞬时
+ 			// 5xx 应先触发多账号 failover，且此时尚未写入下游响应。
+ 			// probeBody 已在上方任务探测时读取过一次，直接复用避免重复读取。
+-			if shouldFailoverOpenAIPassthroughResponse(account, resp.StatusCode, probeBody) {
++			if shouldFailoverOpenAIPassthroughResponse(account, resp.StatusCode, probeBody) || s.openAIAPIKeyCredentialFailure(account, resp.StatusCode, probeBody) {
+ 				return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body, probeBody)
+ 			}
+ 			return nil, s.handleErrorResponsePassthrough(ctx, resp, c, account, body, probeBody)
+@@ -458,7 +461,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 				if signal, ok := asOpenAICompactFallbackSignal(handleErr); ok {
+ 					_ = resp.Body.Close()
+ 					compactResp, compactBody := openAICompactFallbackErrorResponse(resp, signal)
+-					if shouldFailoverOpenAIPassthroughResponse(account, compactResp.StatusCode, compactBody) {
++					if shouldFailoverOpenAIPassthroughResponse(account, compactResp.StatusCode, compactBody) || s.openAIAPIKeyCredentialFailure(account, compactResp.StatusCode, compactBody) {
+ 						return nil, s.handleFailoverErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
+ 					}
+ 					return nil, s.handleErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
+@@ -485,7 +488,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 				if signal, ok := asOpenAICompactFallbackSignal(handleErr); ok {
+ 					_ = resp.Body.Close()
+ 					compactResp, compactBody := openAICompactFallbackErrorResponse(resp, signal)
+-					if shouldFailoverOpenAIPassthroughResponse(account, compactResp.StatusCode, compactBody) {
++					if shouldFailoverOpenAIPassthroughResponse(account, compactResp.StatusCode, compactBody) || s.openAIAPIKeyCredentialFailure(account, compactResp.StatusCode, compactBody) {
+ 						return nil, s.handleFailoverErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
+ 					}
+ 					return nil, s.handleErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
+@@ -1602,6 +1605,53 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
+ 		strings.Contains(combined, "please retry")
+ }
+ 
++// Classify recoverable stream failures without turning parameter or policy
++// rejections into account failures. Compatible providers often use status_code.
++func (s *OpenAIGatewayService) openAIAPIKeyTransientStreamStatus(account *Account, payload []byte, message string) int {
++	if !s.openAIAPIKeyAvailabilityEnabled(account) || !gjson.ValidBytes(payload) {
++		return 0
++	}
++	if hit, _, _ := detectOpenAICyberPolicy(payload); hit {
++		return 0
++	}
++	for _, path := range []string{"response.error.status_code", "error.status_code", "status_code"} {
++		if status := gjson.GetBytes(payload, path).Int(); status >= 400 && status < 500 {
++			return 0
++		}
++	}
++	switch openAIStreamFailedEventSemanticStatus(payload, message) {
++	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, 529:
++		return 0
++	case http.StatusServiceUnavailable:
++		return http.StatusServiceUnavailable
++	}
++	if !openAIStreamFailedEventShouldFailover(payload, message) {
++		return 0
++	}
++	for _, path := range []string{"response.error.status_code", "error.status_code", "status_code"} {
++		if status := int(gjson.GetBytes(payload, path).Int()); openAIAPIKeyAvailabilityTransientStatus(status) {
++			return status
++		}
++	}
++	for _, path := range []string{"response.error.code", "error.code", "response.error.type", "error.type"} {
++		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, path).String())) {
++		case "server_error", "internal_server_error", "internal_error":
++			return http.StatusInternalServerError
++		case "bad_gateway", "upstream_error":
++			return http.StatusBadGateway
++		case "service_unavailable":
++			return http.StatusServiceUnavailable
++		case "gateway_timeout":
++			return http.StatusGatewayTimeout
++		}
++	}
++	return 0
++}
++
++func (s *OpenAIGatewayService) isOpenAIAPIKeyTransientStreamFailure(account *Account, payload []byte, message string) bool {
++	return s.openAIAPIKeyTransientStreamStatus(account, payload, message) != 0
++}
++
+ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
+ 	c *gin.Context,
+ 	account *Account,
+@@ -1611,6 +1661,18 @@ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
+ 	canonicalModel ...string,
+ ) (int, bool) {
+ 	statusCode := openAIStreamFailureStatus(payload, message)
++	if transientStatus := s.openAIAPIKeyTransientStreamStatus(account, payload, message); transientStatus != 0 {
++		statusCode = transientStatus
++		ctx := context.Background()
++		if c != nil && c.Request != nil {
++			ctx = c.Request.Context()
++		}
++		model := firstNonEmpty(canonicalModel...)
++		if model == "" {
++			model = firstNonEmpty(gjson.GetBytes(payload, "model").String(), gjson.GetBytes(payload, "response.model").String())
++		}
++		return statusCode, s.handleOpenAIAccountUpstreamError(ctx, account, statusCode, headers, payload, model)
++	}
+ 	switch statusCode {
+ 	case http.StatusForbidden:
+ 		if !openAIStream403AccountFailure(payload, message) {
+@@ -1631,6 +1693,9 @@ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
+ 			// 普通模型的流式 429 不能继承外层 HTTP 200 的全局 quota 快照；
+ 			// 只有 OAuth/SetupToken 的 Spark 配额 429 才需要保留 headers 读取明确的 5h/7d reset。
+ 			accountHeaders = openAIWSSemantic429Headers(account, model, headers)
++			if s.openAIAPIKeyAvailabilityEnabled(account) && strings.TrimSpace(headers.Get("Retry-After")) != "" {
++				accountHeaders = http.Header{"Retry-After": {headers.Get("Retry-After")}}
++			}
+ 		}
+ 		return statusCode, s.handleOpenAIAccountUpstreamError(ctx, account, statusCode, accountHeaders, payload, model)
+ 	default:
+@@ -1812,6 +1877,7 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
+ 	if terminalType == "error" {
+ 		shouldFailover = openAIStreamErrorEventShouldFailover(payload, message)
+ 	}
++	shouldFailover = shouldFailover || s.isOpenAIAPIKeyTransientStreamFailure(account, payload, message)
+ 	if !shouldFailover {
+ 		return nil
+ 	}
+@@ -1871,6 +1937,24 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 	failedMessage := ""
+ 	clientOutputStarted := false
+ 	codexFailureTerminal := account != nil && account.Platform == PlatformOpenAI
++	terminalSchedulingModel := func(payload []byte, message string) string {
++		if mappedModel == "" && s.isOpenAIAPIKeyTransientStreamFailure(account, payload, message) {
++			// Ordinary passthrough leaves mappedModel empty; retain its billing
++			// semantics while using the same canonical model as the scheduler.
++			return canonicalOpenAIAccountSchedulingModel(account, originalModel)
++		}
++		return mappedModel
++	}
++	availabilityFailureRecorded := false
++	applyTerminalAccountSideEffects := func(payload []byte, message string) {
++		if s.isOpenAIAPIKeyTransientStreamFailure(account, payload, message) {
++			if availabilityFailureRecorded {
++				return
++			}
++			availabilityFailureRecorded = true
++		}
++		s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, resp.Header, terminalSchedulingModel(payload, message))
++	}
+ 	failureDelivered := false
+ 	suppressCurrentEvent := false
+ 	responseFailedPending := false
+@@ -1944,7 +2028,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 			return
+ 		}
+ 		if bareErrorAccountSideEffectsPending {
+-			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
++			applyTerminalAccountSideEffects(bareErrorPayload, failedMessage)
+ 			bareErrorAccountSideEffectsPending = false
+ 		}
+ 		if clientDisconnected || !writePendingLines() {
+@@ -2076,7 +2160,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 						// account health; EOF synthesis applies the pending effect.
+ 						bareErrorAccountSideEffectsPending = true
+ 					} else {
+-						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header, mappedModel)
++						applyTerminalAccountSideEffects(dataBytes, failedMessage)
+ 						bareErrorAccountSideEffectsPending = false
+ 					}
+ 					if eventType == "response.failed" {
+@@ -2093,10 +2177,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 						} else {
+ 							shouldFailover = openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
+ 						}
++						shouldFailover = shouldFailover || s.isOpenAIAPIKeyTransientStreamFailure(account, dataBytes, failedMessage)
+ 					}
+ 					if shouldFailover {
+ 						return resultWithUsage(),
+-							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
++							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, terminalSchedulingModel(dataBytes, failedMessage), resp.Header)
+ 					}
+ 					if !cyberHit && !sawBareError {
+ 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
+@@ -2209,7 +2294,8 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 		if sawFailedEvent {
+ 			return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
+ 		}
+-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		if errors.Is(err, context.Canceled) || (errors.Is(err, context.DeadlineExceeded) && !s.openAIAvailabilityReadFailure(ctx, c, account, err)) ||
++			(s.openAIAPIKeyAvailabilityEnabled(account) && openAIAvailabilityCallerGone(ctx, c, err)) {
+ 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", err)
+ 		}
+ 		if errors.Is(err, bufio.ErrTooLong) {
+@@ -2222,11 +2308,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 				msg += ": " + errText
+ 			}
+ 			return resultWithUsage(),
+-				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, msg)
++				s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, true, upstreamRequestID, openAIAvailabilityModel(account, originalModel, mappedModel), msg, err)
+ 		}
+ 		if clientDisconnected {
+ 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", err)
+ 		}
++		s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, openAIAvailabilityModel(account, originalModel, mappedModel), err)
+ 		s.recordOpenAIProxyStreamDisconnect(account, err, upstreamRequestID)
+ 		logger.LegacyPrintf("service.openai_gateway",
+ 			"[OpenAI passthrough] 流读取异常中断: account=%d request_id=%s err=%v",
+@@ -2247,8 +2334,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
+ 		).Info("OpenAI passthrough 上游流在未收到 [DONE] 时结束，疑似断流")
+ 		if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
+ 			return resultWithUsage(),
+-				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event")
++				s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, true, upstreamRequestID, openAIAvailabilityModel(account, originalModel, mappedModel), "OpenAI stream ended before a terminal event", io.ErrUnexpectedEOF)
+ 		}
++		s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, openAIAvailabilityModel(account, originalModel, mappedModel), io.ErrUnexpectedEOF)
+ 		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+ 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")
+ 	}
+@@ -2270,6 +2358,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
+ ) (*openaiNonStreamingResultPassthrough, error) {
+ 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+ 	if err != nil {
++		if s.openAIAvailabilityReadFailure(ctx, c, account, err) && !openAIStreamClientOutputStarted(c, false) {
++			return nil, s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, true, resp.Header.Get("x-request-id"), openAIAvailabilityModel(account, originalModel, mappedModel), "OpenAI response body could not be read", err)
++		}
+ 		return nil, err
+ 	}
+ 	observer := upstreamResponseModelObserverFromContext(c)
+@@ -2349,7 +2440,11 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
+ 		if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
+ 			return nil, compactErr
+ 		}
+-		if failoverErr := s.nonStreamingTerminalFailureFailover(c, resp, account, true, terminalType, terminalPayload, msg, mappedModel); failoverErr != nil {
++		terminalModel := mappedModel
++		if terminalModel == "" && s.isOpenAIAPIKeyTransientStreamFailure(account, terminalPayload, msg) {
++			terminalModel = canonicalOpenAIAccountSchedulingModel(account, originalModel)
++		}
++		if failoverErr := s.nonStreamingTerminalFailureFailover(c, resp, account, true, terminalType, terminalPayload, msg, terminalModel); failoverErr != nil {
+ 			return nil, failoverErr
+ 		}
+ 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
+diff --git a/backend/internal/service/openai_gateway_response_handling.go b/backend/internal/service/openai_gateway_response_handling.go
+index d5b35e858..000eea106 100644
+--- a/backend/internal/service/openai_gateway_response_handling.go
++++ b/backend/internal/service/openai_gateway_response_handling.go
+@@ -7,6 +7,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"sort"
+ 	"strconv"
+@@ -254,6 +255,16 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 	failedMessage := ""
+ 	clientOutputStarted := false
+ 	codexFailureTerminal := account != nil && account.IsOpenAIOAuthLike()
++	availabilityFailureRecorded := false
++	applyTerminalAccountSideEffects := func(payload []byte, message string) {
++		if s.isOpenAIAPIKeyTransientStreamFailure(account, payload, message) {
++			if availabilityFailureRecorded {
++				return
++			}
++			availabilityFailureRecorded = true
++		}
++		s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, resp.Header, mappedModel)
++	}
+ 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+ 	var streamEarlyErr error
+ 	terminalFailurePending := false
+@@ -373,7 +384,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 			completeGuardedEvent(true)
+ 		}
+ 		if codexFailureTerminal && sawBareError && !sawResponseFailed && bareErrorAccountSideEffectsPending {
+-			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
++			applyTerminalAccountSideEffects(bareErrorPayload, failedMessage)
+ 			bareErrorAccountSideEffectsPending = false
+ 		}
+ 		if codexFailureTerminal && sawBareError && !sawResponseFailed && !clientDisconnected {
+@@ -388,18 +399,13 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 			s.clearOpenAIProxyStreamDisconnect(account)
+ 		}
+ 		if !sawTerminalEvent && !openAIStreamClientOutputStarted(c, clientOutputStarted) && !eventShouldFlush {
+-			return resultWithUsage(), s.newOpenAIStreamFailoverError(
+-				c,
+-				account,
+-				false,
+-				upstreamRequestID,
+-				nil,
+-				"OpenAI stream ended before a terminal event",
+-			)
++			return resultWithUsage(), s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, false, upstreamRequestID,
++				openAIAvailabilityModel(account, originalModel, mappedModel), "OpenAI stream ended before a terminal event", io.ErrUnexpectedEOF)
+ 		}
+ 		flushPending("Client disconnected during final flush, returning collected usage")
+ 		if !sawTerminalEvent {
+ 			if openAIStreamClientOutputStarted(c, clientOutputStarted) && !clientDisconnected {
++				s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, openAIAvailabilityModel(account, originalModel, mappedModel), io.ErrUnexpectedEOF)
+ 				s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+ 			}
+ 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
+@@ -442,7 +448,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 		}
+ 		// 客户端断开/取消请求时，上游读取往往会返回 context canceled。
+ 		// /v1/responses 的 SSE 事件必须符合 OpenAI 协议；这里不注入自定义 error event，避免下游 SDK 解析失败。
+-		if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
++		if errors.Is(scanErr, context.Canceled) || (errors.Is(scanErr, context.DeadlineExceeded) && !s.openAIAvailabilityReadFailure(ctx, c, account, scanErr)) ||
++			(s.openAIAPIKeyAvailabilityEnabled(account) && openAIAvailabilityCallerGone(ctx, c, scanErr)) {
+ 			if eventShouldFlush {
+ 				flushPending("Client disconnected during canceled stream flush, returning collected usage")
+ 			}
+@@ -458,12 +465,13 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 			if errText := strings.TrimSpace(scanErr.Error()); errText != "" {
+ 				msg += ": " + errText
+ 			}
+-			return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, false, upstreamRequestID, nil, msg), true
++			return resultWithUsage(), s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, false, upstreamRequestID, openAIAvailabilityModel(account, originalModel, mappedModel), msg, scanErr), true
+ 		}
+ 		// 客户端已断开时，上游出错仅影响体验，不影响计费；返回已收集 usage
+ 		if clientDisconnected {
+ 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", scanErr), true
+ 		}
++		s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, openAIAvailabilityModel(account, originalModel, mappedModel), scanErr)
+ 		s.recordOpenAIProxyStreamDisconnect(account, scanErr, upstreamRequestID)
+ 		sendErrorEvent("stream_read_error")
+ 		return resultWithUsage(), fmt.Errorf("stream read error: %w", scanErr), true
+@@ -558,7 +566,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 						// Defer account health updates so the pair is applied once.
+ 						bareErrorAccountSideEffectsPending = true
+ 					} else {
+-						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header, mappedModel)
++						applyTerminalAccountSideEffects(dataBytes, failedMessage)
+ 						bareErrorAccountSideEffectsPending = false
+ 					}
+ 					if eventType == "response.failed" {
+@@ -576,6 +584,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 						} else {
+ 							shouldFailover = openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
+ 						}
++						shouldFailover = shouldFailover || s.isOpenAIAPIKeyTransientStreamFailure(account, dataBytes, failedMessage)
+ 					}
+ 					if shouldFailover {
+ 						sawFailedEvent = true
+@@ -900,10 +909,21 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 				return resultWithUsage(), fmt.Errorf("stream usage incomplete after timeout")
+ 			}
+ 			logger.LegacyPrintf("service.openai_gateway", "Stream data interval timeout: account=%d model=%s interval=%s", account.ID, originalModel, streamInterval)
+-			// 处理流超时，可能标记账户为临时不可调度或错误状态
++			if s.openAIAPIKeyAvailabilityEnabled(account) && openAIAvailabilityCallerGone(ctx, c, nil) {
++				return resultWithUsage(), context.Canceled
++			}
++			// Preserve the administrator's existing timeout policy before failover.
+ 			if s.rateLimitService != nil {
+ 				s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
+ 			}
++			if s.openAIAPIKeyAvailabilityEnabled(account) {
++				model := openAIAvailabilityModel(account, originalModel, mappedModel)
++				if !openAIStreamClientOutputStarted(c, clientOutputStarted) && !eventShouldFlush {
++					_ = resp.Body.Close()
++					return resultWithUsage(), s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, false, upstreamRequestID, model, "OpenAI stream data interval timeout", context.DeadlineExceeded)
++				}
++				s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, model, context.DeadlineExceeded)
++			}
+ 			// Grok: short cool + account failover when no client-visible bytes
+ 			// were committed yet (pre-commit). After output started we keep the
+ 			// legacy stream_timeout path so partial SSE is not dual-written.
+@@ -933,7 +953,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
+ 			return resultWithUsage(), s.newOpenAIFirstOutputTimeoutError(
+ 				ctx, c, account, opsUpstreamProxyID(account), opsUpstreamProxyName(account),
+ 				startTime, originalModel, reasoningEffort,
+-				firstOutputTimeout, "semantic_output", resp.Header,
++				firstOutputTimeout, "semantic_output", resp.Header, openAIAvailabilityModel(account, originalModel, mappedModel),
+ 			)
+ 
+ 		case <-keepaliveCh:
+@@ -1567,6 +1587,9 @@ func openAICacheCreationTokensFromUsage(value gjson.Result) int {
+ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+ 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+ 	if err != nil {
++		if s.openAIAvailabilityReadFailure(ctx, c, account, err) && !openAIStreamClientOutputStarted(c, false) {
++			return nil, s.newOpenAIAvailabilityStreamTransportError(ctx, c, account, false, resp.Header.Get("x-request-id"), openAIAvailabilityModel(account, originalModel, mappedModel), "OpenAI response body could not be read", err)
++		}
+ 		return nil, err
+ 	}
+ 	observer := upstreamResponseModelObserverFromContext(c)
+diff --git a/backend/internal/service/openai_gateway_upstream_errors.go b/backend/internal/service/openai_gateway_upstream_errors.go
+index b5985a226..0f02af823 100644
+--- a/backend/internal/service/openai_gateway_upstream_errors.go
++++ b/backend/internal/service/openai_gateway_upstream_errors.go
+@@ -388,6 +388,12 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
+ 		upstreamMsg,
+ 		retryableOnSameAccount || oauth429Retry,
+ 	)
++	if s.openAIAPIKeyAvailabilityEnabled(account) &&
++		(openAIAPIKeyAvailabilityTransientStatus(statusCode) || statusCode == http.StatusTooManyRequests || s.openAIAPIKeyCredentialFailure(account, statusCode, responseBody)) {
++		// The account/model cooldown excludes this attempt; do not spend the
++		// request-local same-account retry budget on the unavailable route.
++		failoverErr.RetryableOnSameAccount = false
++	}
+ 	if oauth429Retry {
+ 		failoverErr.SameAccountRetryDeadline = s.openAIOAuth429RetryDeadline(account)
+ 		failoverErr.SameAccountRetryDelay = openAIOAuth429SameAccountRetryDelay(responseHeaders, failoverErr.SameAccountRetryDeadline)
+@@ -442,6 +448,19 @@ func isOpenAIHTTPUpstreamAccessStateError(_ int, _ string, body []byte) bool {
+ 	return isOpenAIUpstreamAccessStateError("", body)
+ }
+ 
++func (s *OpenAIGatewayService) openAIAPIKeyCredentialFailure(account *Account, statusCode int, body []byte) bool {
++	if !s.openAIAPIKeyAvailabilityEnabled(account) || !gjson.ValidBytes(body) {
++		return false
++	}
++	if isOpenAIUpstreamAccessStateError("", body) {
++		return true
++	}
++	if statusCode == http.StatusUnauthorized {
++		return gjson.GetBytes(body, "error").IsObject() || openAIStreamCredentialAuthFailure(body)
++	}
++	return statusCode == http.StatusForbidden && openAIStreamCredentialAuthFailure(body)
++}
++
+ func openAICapacityShedClientMessage(upstreamMsg string, body []byte) string {
+ 	for _, candidate := range []string{
+ 		upstreamMsg,
+diff --git a/backend/internal/service/openai_upstream_transport_error.go b/backend/internal/service/openai_upstream_transport_error.go
+index 6072704f5..17c740e8b 100644
+--- a/backend/internal/service/openai_upstream_transport_error.go
++++ b/backend/internal/service/openai_upstream_transport_error.go
+@@ -105,7 +105,7 @@ func classifyUpstreamTransportError(err error) upstreamTransportErrorClass {
+ // (failover, or a protocol-correct error once failover is exhausted).
+ //
+ // passthrough tags the Ops error event for the OpenAI passthrough forward path.
+-func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Context, c *gin.Context, account *Account, err error, passthrough bool) error {
++func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Context, c *gin.Context, account *Account, err error, passthrough bool, canonicalModel ...string) error {
+ 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
+ 	setOpsUpstreamError(c, 0, safeErr, "")
+ 	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+@@ -125,6 +125,9 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
+ 	if errors.Is(err, context.Canceled) || (errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+ 		return err
+ 	}
++	if s.openAIAPIKeyAvailabilityEnabled(account) && openAIAvailabilityCallerGone(ctx, c, err) {
++		return err
++	}
+ 
+ 	// Transport attempt reached the network path; count as Ollama Cloud activity.
+ 	if s != nil {
+@@ -139,6 +142,8 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
+ 
+ 	if classifyUpstreamTransportError(err).Persistent {
+ 		s.tempUnscheduleOpenAITransportError(ctx, account, safeErr)
++	} else {
++		s.recordOpenAIAvailabilityTransportFailure(ctx, c, account, firstNonEmpty(canonicalModel...), err)
+ 	}
+ 
+ 	return &UpstreamFailoverError{
+diff --git a/backend/internal/service/ops_port.go b/backend/internal/service/ops_port.go
+index 02186b6a2..ef25038ee 100644
+--- a/backend/internal/service/ops_port.go
++++ b/backend/internal/service/ops_port.go
+@@ -196,6 +196,7 @@ type OpsInsertSystemLogInput struct {
+ }
+ 
+ type OpsSystemLogFilter struct {
++	Event     string // Exact event message; empty preserves the existing log search.
+ 	StartTime *time.Time
+ 	EndTime   *time.Time
+ 	Host      string
+diff --git a/backend/internal/service/ratelimit_service.go b/backend/internal/service/ratelimit_service.go
+index 47f234f85..3aadd8d01 100644
+--- a/backend/internal/service/ratelimit_service.go
++++ b/backend/internal/service/ratelimit_service.go
+@@ -1152,6 +1152,9 @@ func (s *RateLimitService) handle429(ctx context.Context, account *Account, head
+ 		}
+ 		return
+ 	}
++	if s.handleOpenAIAPIKeyAvailabilityRetryAfter(ctx, account, headers, responseBody) {
++		return
++	}
+ 	// 国产供应商（kimi/zhipu/deepseek）的 429 走专用可恢复路径：余额不足 → 临时停调，
+ 	// Coding Plan 窗口耗尽 → 冷却到快照重置点。未命中则继续默认 429 逻辑。
+ 	if account.IsCNProvider() {
+@@ -1274,6 +1277,39 @@ func (s *RateLimitService) handle429(ctx context.Context, account *Account, head
+ 	slog.Info("account_rate_limited", "account_id", account.ID, "reset_at", resetAt)
+ }
+ 
++// Retry-After is a backoff floor for API-key rate limits. Keep longer quota reset
++// windows, but cap this untrusted hint at one day; the existing quota path still
++// owns longer quota reset windows and the fallback when the hint is absent.
++func (s *RateLimitService) handleOpenAIAPIKeyAvailabilityRetryAfter(ctx context.Context, account *Account, headers http.Header, body []byte) bool {
++	if s == nil || s.cfg == nil || !s.cfg.Gateway.OpenAIAPIKeyAvailabilityEnabled || account == nil ||
++		account.Platform != PlatformOpenAI || account.Type != AccountTypeAPIKey || account.IsPoolMode() {
++		return false
++	}
++	now := time.Now()
++	resetAt := parseRetryAfterResetTime(headers, now)
++	if resetAt == nil || !resetAt.After(now) {
++		return false
++	}
++	until := *resetAt
++	if maximum := now.Add(24 * time.Hour); until.After(maximum) {
++		until = maximum
++	}
++	if quotaReset := s.calculateOpenAI429ResetTime(headers); quotaReset != nil && quotaReset.After(until) {
++		until = *quotaReset
++	}
++	if quotaReset := parseOpenAIRateLimitResetTime(body); quotaReset != nil && time.Unix(*quotaReset, 0).After(until) {
++		until = time.Unix(*quotaReset, 0)
++	}
++	persistOpenAI429PlanType(ctx, s.accountRepo, account, body)
++	s.persistOpenAICodexSnapshot(ctx, account, headers)
++	notifyOpenAIAutoReset(account.ID)
++	s.notifyAccountSchedulingBlocked(account, until, "429")
++	if err := s.accountRepo.SetRateLimited(ctx, account.ID, until); err != nil {
++		slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
++	}
++	return true
++}
++
+ func (s *RateLimitService) apply429FallbackRateLimit(ctx context.Context, account *Account, reason string) {
+ 	cooldown, enabled := s.get429FallbackCooldown(ctx, account)
+ 	if !enabled {
+diff --git a/frontend/src/api/admin/ops.ts b/frontend/src/api/admin/ops.ts
+index bb8b31eb2..d8614ee1a 100644
+--- a/frontend/src/api/admin/ops.ts
++++ b/frontend/src/api/admin/ops.ts
+@@ -845,6 +845,7 @@ export interface OpsSystemLog {
+ export type OpsSystemLogListResponse = PaginatedResponse<OpsSystemLog>
+ 
+ export interface OpsSystemLogQuery {
++  event?: string
+   page?: number
+   page_size?: number
+   time_range?: '5m' | '30m' | '1h' | '6h' | '24h' | '7d' | '30d'
+@@ -1128,8 +1129,8 @@ export async function updateErrorResolved(errorId: number, resolved: boolean): P
+ }
+ 
+ // New split endpoints
+-export async function listRequestErrors(params: OpsErrorListQueryParams): Promise<OpsErrorLogsResponse> {
+-  const { data } = await apiClient.get<OpsErrorLogsResponse>('/admin/ops/request-errors', { params })
++export async function listRequestErrors(params: OpsErrorListQueryParams, options: OpsRequestOptions = {}): Promise<OpsErrorLogsResponse> {
++  const { data } = await apiClient.get<OpsErrorLogsResponse>('/admin/ops/request-errors', { params, signal: options.signal })
+   return data
+ }
+ 
+@@ -1268,8 +1269,8 @@ export async function resetRuntimeLogConfig(): Promise<OpsRuntimeLogConfig> {
+   return data
+ }
+ 
+-export async function listSystemLogs(params: OpsSystemLogQuery): Promise<OpsSystemLogListResponse> {
+-  const { data } = await apiClient.get<OpsSystemLogListResponse>('/admin/ops/system-logs', { params })
++export async function listSystemLogs(params: OpsSystemLogQuery, options: OpsRequestOptions = {}): Promise<OpsSystemLogListResponse> {
++  const { data } = await apiClient.get<OpsSystemLogListResponse>('/admin/ops/system-logs', { params, signal: options.signal })
+   return data
+ }
+ 
+diff --git a/frontend/src/components/layout/AppSidebar.vue b/frontend/src/components/layout/AppSidebar.vue
+index b15866567..81dfda169 100644
+--- a/frontend/src/components/layout/AppSidebar.vue
++++ b/frontend/src/components/layout/AppSidebar.vue
+@@ -763,6 +763,7 @@ const adminNavItems = computed((): NavItem[] => {
+   const baseItems: NavItem[] = [
+     { path: '/admin/dashboard', label: t('nav.dashboard'), icon: DashboardIcon },
+     { path: '/admin/ops', label: t('nav.ops'), icon: ChartIcon, featureFlag: flagOpsMonitoring },
++    { path: '/admin/availability', label: t('admin.ops.availability.title'), icon: ChartIcon, featureFlag: flagOpsMonitoring },
+     { path: '/admin/users', label: t('nav.users'), icon: UsersIcon, hideInSimpleMode: true },
+     { path: '/admin/groups', label: t('nav.groups'), icon: FolderIcon },
+     {
+diff --git a/frontend/src/i18n/locales/en/admin/ops.ts b/frontend/src/i18n/locales/en/admin/ops.ts
+index 46cd922b6..95f5ee14d 100644
+--- a/frontend/src/i18n/locales/en/admin/ops.ts
++++ b/frontend/src/i18n/locales/en/admin/ops.ts
+@@ -1,5 +1,55 @@
+ export default {
+     ops: {
++      availability: {
++        title: 'Scheduling Monitor',
++        description: 'OpenAI account switches, cooldown events and request outcomes',
++        scope: 'OpenAI · All groups',
++        refresh: 'Refresh',
++        autoRefresh: 'Refresh every 60 seconds',
++        updatedAt: 'Updated at {time}',
++        loading: 'Loading monitoring data…',
++        refreshFailed: 'Refresh failed. Previous data is retained; please try again.',
++        traceFailed: 'Could not load related logs. Please retry.',
++        switches: 'Switch attempts',
++        switchesHint: 'Recorded switch actions; inspect request details for the outcome',
++        cooldowns: 'Cooldown events',
++        cooldownsHint: 'Historical events remain after an account recovers',
++        errors: 'Request errors',
++        errorsHint: 'Recorded final request errors, including routing and client limits',
++        ttft: 'First token P95',
++        ttftHint: '95% of recorded samples are at or below this value · Target: 5 seconds',
++        ttftNote: 'First-token metrics cover the upstream forwarding attempt and may include reasoning events. Waiting on earlier failed accounts is excluded; this is not the total client wait for visible text.',
++        recordsNote: 'Data comes from stored Ops logs. Sampling, retention and ingestion delays affect completeness; no records does not prove no events occurred.',
++        eventsTitle: 'Account switches and cooldowns',
++        eventsHint: 'The latest 20 records of each event type, ordered by time',
++        errorsTitle: 'Recent request issues',
++        errorsListHint: 'The latest 20 errors in the selected window',
++        emptyEvents: 'No switch or cooldown records found in this window',
++        emptyErrors: 'No request error records found in this window',
++        time: 'Time',
++        event: 'Event',
++        account: 'Account',
++        model: 'Model',
++        detail: 'Details',
++        switchEvent: 'Switch attempted',
++        cooldownEvent: 'Cooldown recorded',
++        cooldownDuration: '{seconds}s · Failure streak: {streak}',
++        upstreamStatus: 'Upstream status {status}',
++        requestTrace: 'Request details',
++        requestId: 'Request ID',
++        traceTitle: 'Related request logs',
++        traceHint: 'The latest 100 logs for the same request ID, with diagnostic fields only.',
++        finalResponse: 'Final HTTP response',
++        pendingResponse: 'No final response record found yet',
++        streamNote: 'HTTP 200 is a response status. Check error details and terminal events to establish whether a stream completed.',
++        noTrace: 'No request ID was recorded; use the account and time to investigate',
++        noTraceLogs: 'No related logs found',
++        status: 'Status',
++        seconds: '{value}s',
++        openOps: 'Full Ops dashboard',
++        openErrors: 'All request records',
++        windowNote: 'Window: {start} to {end}'
++      },
+       title: 'Ops Monitoring',
+       description: 'Operational monitoring and troubleshooting',
+       // Dashboard
+diff --git a/frontend/src/i18n/locales/zh/admin/ops.ts b/frontend/src/i18n/locales/zh/admin/ops.ts
+index c95ea7fee..4e083c434 100644
+--- a/frontend/src/i18n/locales/zh/admin/ops.ts
++++ b/frontend/src/i18n/locales/zh/admin/ops.ts
+@@ -1,5 +1,55 @@
+ export default {
+     ops: {
++      availability: {
++        title: '调度监控',
++        description: '集中查看 OpenAI 账号切换、异常冷却和请求反馈',
++        scope: 'OpenAI · 全部分组',
++        refresh: '刷新',
++        autoRefresh: '每 60 秒自动刷新',
++        updatedAt: '更新于 {time}',
++        loading: '正在读取监控数据…',
++        refreshFailed: '更新失败。已有数据保留，请稍后刷新。',
++        traceFailed: '关联日志加载失败，请重试。',
++        switches: '切换尝试',
++        switchesHint: '已记录的换号动作；最终结果见请求明细',
++        cooldowns: '冷却记录',
++        cooldownsHint: '历史冷却事件，恢复后记录仍会保留',
++        errors: '请求报错',
++        errorsHint: '已记录的最终请求错误，含路由和客户端限制',
++        ttft: '首 Token P95',
++        ttftHint: '95% 的已有样本不超过此值 · 参考目标 5 秒',
++        ttftNote: '首 Token 使用现有上游转发统计，可能含推理事件；换号前失败尝试的等待不包含在内，不能等同于客户看到正文的总等待时间。',
++        recordsNote: '数据来自已保存的运维日志。采样、保留期限或记录延迟会影响完整性；未查到记录不代表从未发生。',
++        eventsTitle: '账号切换与冷却',
++        eventsHint: '按时间展示两类事件各自最新的 20 条',
++        errorsTitle: '最近请求问题',
++        errorsListHint: '当前时间范围内最新 20 条错误',
++        emptyEvents: '当前时间范围内没有查到切换或冷却记录',
++        emptyErrors: '当前时间范围内没有查到请求报错',
++        time: '发生时间',
++        event: '事件',
++        account: '账号',
++        model: '模型',
++        detail: '详情',
++        switchEvent: '尝试换号',
++        cooldownEvent: '异常冷却',
++        cooldownDuration: '{seconds} 秒 · 连续故障 {streak} 次',
++        upstreamStatus: '上游状态 {status}',
++        requestTrace: '请求明细',
++        requestId: '请求 ID',
++        traceTitle: '请求关联日志',
++        traceHint: '展示同一请求 ID 下最新 100 条日志，仅显示定位所需字段。',
++        finalResponse: '最终 HTTP 响应',
++        pendingResponse: '尚未查到最终响应记录',
++        streamNote: 'HTTP 200 仅表示响应状态；流式响应是否完整，应结合错误详情和完成事件判断。',
++        noTrace: '该事件未记录请求 ID，可按账号和时间定位',
++        noTraceLogs: '没有查到关联日志',
++        status: '状态',
++        seconds: '{value} 秒',
++        openOps: '完整运维监控',
++        openErrors: '查看全部请求记录',
++        windowNote: '统计窗口：{start} 至 {end}'
++      },
+       title: '运维监控',
+       description: '运维监控与排障',
+       // Dashboard
+diff --git a/frontend/src/router/index.ts b/frontend/src/router/index.ts
+index 6ca13f3c5..b81123b67 100644
+--- a/frontend/src/router/index.ts
++++ b/frontend/src/router/index.ts
+@@ -413,6 +413,18 @@ const routes: RouteRecordRaw[] = [
+       descriptionKey: 'admin.dashboard.description'
+     }
+   },
++  {
++    path: '/admin/availability',
++    name: 'AdminAvailability',
++    component: () => import('@/views/admin/AvailabilityMonitorView.vue'),
++    meta: {
++      requiresAuth: true,
++      requiresAdmin: true,
++      title: 'Scheduling Monitor',
++      titleKey: 'admin.ops.availability.title',
++      descriptionKey: 'admin.ops.availability.description'
++    }
++  },
+   {
+     path: '/admin/ops',
+     name: 'AdminOps',
+diff --git a/frontend/src/views/admin/AvailabilityMonitorView.vue b/frontend/src/views/admin/AvailabilityMonitorView.vue
+new file mode 100644
+index 000000000..8e5f25e8b
+--- /dev/null
++++ b/frontend/src/views/admin/AvailabilityMonitorView.vue
+@@ -0,0 +1,283 @@
++<script setup lang="ts">
++import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
++import { useI18n } from 'vue-i18n'
++import { RouterLink } from 'vue-router'
++import AppLayout from '@/components/layout/AppLayout.vue'
++import BaseDialog from '@/components/common/BaseDialog.vue'
++import Select from '@/components/common/Select.vue'
++import OpsErrorDetailModal from './ops/components/OpsErrorDetailModal.vue'
++import { opsAPI, type OpsDashboardOverview, type OpsErrorLogsResponse, type OpsSystemLog, type OpsSystemLogListResponse } from '@/api/admin/ops'
++
++const SWITCH_EVENT = 'openai.upstream_failover_switching'
++const COOLDOWN_EVENT = 'openai_model_transient_state'
++type WindowRange = '5m' | '30m' | '1h'
++interface Snapshot {
++  range: WindowRange
++  start: string
++  end: string
++  overview: OpsDashboardOverview
++  switches: OpsSystemLogListResponse
++  cooldowns: OpsSystemLogListResponse
++  errors: OpsErrorLogsResponse
++}
++
++const { t } = useI18n()
++const label = (key: string) => t(`admin.ops.availability.${key}`)
++const range = ref<WindowRange>('30m')
++const autoRefresh = ref(true)
++const loading = ref(false)
++const error = ref(false)
++const snapshot = ref<Snapshot | null>(null)
++const selectedErrorId = ref<number | null>(null)
++const showError = ref(false)
++const traceRequest = ref('')
++const traceLogs = ref<OpsSystemLog[]>([])
++const traceLoading = ref(false)
++const traceError = ref(false)
++let refreshController: AbortController | null = null
++let traceController: AbortController | null = null
++let timer: ReturnType<typeof setInterval> | undefined
++let disposed = false
++
++const rangeOptions = computed(() => (['5m', '30m', '1h'] as const).map(value => ({
++  value, label: t(`admin.ops.timeRange.${value}`)
++})))
++const events = computed(() => {
++  if (!snapshot.value) return []
++  return [...snapshot.value.switches.items, ...snapshot.value.cooldowns.items]
++    .filter(row => row.message === SWITCH_EVENT || row.message === COOLDOWN_EVENT)
++    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
++})
++const finalResponse = computed(() => traceLogs.value.find(row =>
++  row.message === 'http request completed' && row.request_id === traceRequest.value
++))
++
++function numberField(value: unknown): number | null {
++  if (value === null || value === undefined || value === '') return null
++  const result = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
++  return Number.isFinite(result) ? result : null
++}
++
++function seconds(value: unknown): string {
++  const ms = numberField(value)
++  return ms === null ? '—' : t('admin.ops.availability.seconds', { value: (ms / 1000).toFixed(2) })
++}
++
++function time(value: string): string {
++  const date = new Date(value)
++  return Number.isFinite(date.getTime()) ? date.toLocaleString() : '—'
++}
++
++function eventDetail(row: OpsSystemLog): string {
++  if (row.message === COOLDOWN_EVENT) {
++    const duration = numberField(row.extra?.cooldown_ms)
++    return t('admin.ops.availability.cooldownDuration', {
++      seconds: duration === null ? '—' : (duration / 1000).toFixed(0),
++      streak: numberField(row.extra?.failure_streak) ?? '—'
++    })
++  }
++  return t('admin.ops.availability.upstreamStatus', { status: numberField(row.extra?.upstream_status) ?? '—' })
++}
++
++async function refresh(): Promise<void> {
++  if (disposed || document.hidden) return
++  refreshController?.abort()
++  const controller = new AbortController()
++  refreshController = controller
++  loading.value = true
++  error.value = false
++  const selectedRange = range.value
++  if (snapshot.value && snapshot.value.range !== selectedRange) snapshot.value = null
++  const end = new Date().toISOString()
++  const minutes = { '5m': 5, '30m': 30, '1h': 60 }[selectedRange]
++  const start = new Date(Date.parse(end) - minutes * 60_000).toISOString()
++  const window = { start_time: start, end_time: end }
++  const options = { signal: controller.signal }
++  try {
++    // All four queries use the same window. Event logs deliberately omit the
++    // platform filter because these OpenAI events may have a null platform.
++    const [overview, switches, cooldowns, errors] = await Promise.all([
++      opsAPI.getDashboardOverview({ ...window, platform: 'openai', mode: 'raw' }, options),
++      opsAPI.listSystemLogs({ ...window, event: SWITCH_EVENT, page: 1, page_size: 20 }, options),
++      opsAPI.listSystemLogs({ ...window, event: COOLDOWN_EVENT, page: 1, page_size: 20 }, options),
++      opsAPI.listRequestErrors({ ...window, platform: 'openai', view: 'all', page: 1, page_size: 20 }, options)
++    ])
++    if (disposed || refreshController !== controller || controller.signal.aborted) return
++    snapshot.value = { range: selectedRange, start, end, overview, switches, cooldowns, errors }
++  } catch {
++    if (refreshController === controller && !controller.signal.aborted && !disposed) {
++      error.value = true
++      controller.abort()
++    }
++  } finally {
++    if (refreshController === controller && !disposed) loading.value = false
++  }
++}
++
++async function openTrace(row: OpsSystemLog): Promise<void> {
++  if (!row.request_id) return
++  traceController?.abort()
++  const controller = new AbortController()
++  traceController = controller
++  traceRequest.value = row.request_id
++  traceLogs.value = []
++  traceLoading.value = true
++  traceError.value = false
++  try {
++    const result = await opsAPI.listSystemLogs({
++      request_id: row.request_id, time_range: '24h', page: 1, page_size: 100
++    }, { signal: controller.signal })
++    if (disposed || traceController !== controller || controller.signal.aborted) return
++    traceLogs.value = result.items.filter(item => item.request_id === row.request_id)
++      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
++  } catch {
++    if (traceController === controller && !controller.signal.aborted && !disposed) traceError.value = true
++  } finally {
++    if (traceController === controller && !disposed) traceLoading.value = false
++  }
++}
++
++function closeTrace(): void {
++  traceController?.abort()
++  traceRequest.value = ''
++}
++
++function openError(id: number): void {
++  selectedErrorId.value = id
++  showError.value = true
++}
++
++function visibilityChanged(): void {
++  if (document.hidden) {
++    refreshController?.abort()
++    if (traceLoading.value && traceRequest.value) traceError.value = true
++    traceController?.abort()
++    loading.value = false
++  } else if (autoRefresh.value) {
++    void refresh()
++  }
++}
++
++watch(range, () => { void refresh() })
++onMounted(() => {
++  void refresh()
++  timer = setInterval(() => {
++    if (autoRefresh.value && !loading.value && !document.hidden) void refresh()
++  }, 60_000)
++  document.addEventListener('visibilitychange', visibilityChanged)
++})
++onUnmounted(() => {
++  disposed = true
++  refreshController?.abort()
++  traceController?.abort()
++  clearInterval(timer)
++  document.removeEventListener('visibilitychange', visibilityChanged)
++})
++</script>
++
++<template>
++  <AppLayout>
++    <div class="space-y-6 pb-10">
++      <header class="flex flex-wrap items-start justify-between gap-4">
++        <div>
++          <div class="mb-2 text-xs font-medium text-primary-600 dark:text-primary-400">{{ label('scope') }}</div>
++          <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">{{ label('title') }}</h1>
++          <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{{ label('description') }}</p>
++        </div>
++        <div class="flex flex-wrap items-center gap-3">
++          <Select v-model="range" :options="rangeOptions" class="w-32" />
++          <button class="btn btn-secondary" :disabled="loading" data-testid="refresh" @click="refresh">{{ label('refresh') }}</button>
++          <RouterLink to="/admin/ops" class="text-sm text-primary-600 hover:underline">{{ label('openOps') }}</RouterLink>
++        </div>
++      </header>
++
++      <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-gray-500 dark:text-gray-400">
++        <label class="flex cursor-pointer items-center gap-2"><input v-model="autoRefresh" type="checkbox" class="rounded border-gray-300" />{{ label('autoRefresh') }}</label>
++        <span v-if="snapshot">{{ t('admin.ops.availability.updatedAt', { time: time(snapshot.end) }) }}</span>
++      </div>
++      <div v-if="error" role="alert" class="rounded-xl bg-amber-50 p-4 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">{{ label('refreshFailed') }}</div>
++      <div v-if="loading && !snapshot" role="status" class="card p-10 text-center text-sm text-gray-500">{{ label('loading') }}</div>
++
++      <template v-if="snapshot">
++        <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
++          <section v-for="metric in [
++            { key: 'switches', value: snapshot.switches.total },
++            { key: 'cooldowns', value: snapshot.cooldowns.total },
++            { key: 'errors', value: snapshot.errors.total }
++          ]" :key="metric.key" class="card p-5">
++            <h2 class="text-sm font-medium text-gray-500 dark:text-gray-400">{{ label(metric.key) }}</h2>
++            <div class="mt-3 text-3xl font-semibold tabular-nums text-gray-900 dark:text-white" :data-testid="metric.key">{{ metric.value }}</div>
++            <p class="mt-3 text-xs leading-5 text-gray-500 dark:text-gray-400">{{ label(metric.key + 'Hint') }}</p>
++          </section>
++          <section class="card p-5">
++            <h2 class="text-sm font-medium text-gray-500 dark:text-gray-400">{{ label('ttft') }}</h2>
++            <div data-testid="ttft" class="mt-3 text-3xl font-semibold tabular-nums" :class="(snapshot.overview.ttft.p95_ms ?? 0) > 5000 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-900 dark:text-white'">{{ seconds(snapshot.overview.ttft.p95_ms) }}</div>
++            <p class="mt-3 text-xs leading-5 text-gray-500 dark:text-gray-400">{{ label('ttftHint') }}</p>
++          </section>
++        </div>
++        <p class="text-xs leading-6 text-gray-500 dark:text-gray-400">{{ label('ttftNote') }}</p>
++
++        <section class="card overflow-hidden">
++          <div class="border-b border-gray-100 p-5 dark:border-dark-700">
++            <h2 class="font-semibold text-gray-900 dark:text-white">{{ label('eventsTitle') }}</h2>
++            <p class="mt-1 text-xs text-gray-500">{{ label('eventsHint') }}</p>
++          </div>
++          <div v-if="!events.length" class="p-10 text-center text-sm text-gray-500">{{ label('emptyEvents') }}</div>
++          <div v-else class="overflow-x-auto">
++            <table class="w-full text-left text-sm">
++              <thead class="bg-gray-50 text-xs text-gray-500 dark:bg-dark-900"><tr><th v-for="key in ['time', 'event', 'account', 'model', 'detail', 'requestTrace']" :key="key" class="whitespace-nowrap px-5 py-3">{{ label(key) }}</th></tr></thead>
++              <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
++                <tr v-for="row in events" :key="row.id">
++                  <td class="whitespace-nowrap px-5 py-4 text-xs text-gray-500">{{ time(row.created_at) }}</td>
++                  <td class="whitespace-nowrap px-5 py-4"><span class="rounded-full px-2 py-1 text-xs" :class="row.message === COOLDOWN_EVENT ? 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300' : 'bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300'">{{ label(row.message === COOLDOWN_EVENT ? 'cooldownEvent' : 'switchEvent') }}</span></td>
++                  <td class="px-5 py-4 tabular-nums">{{ row.account_id == null ? '—' : '#' + row.account_id }}</td>
++                  <td class="px-5 py-4">{{ row.model || '—' }}</td>
++                  <td class="whitespace-nowrap px-5 py-4 text-xs">{{ eventDetail(row) }}</td>
++                  <td class="px-5 py-4"><button v-if="row.request_id" class="whitespace-nowrap text-primary-600 hover:underline" data-testid="trace" @click="openTrace(row)">{{ label('requestTrace') }}</button><span v-else :title="label('noTrace')" class="text-gray-400">—</span></td>
++                </tr>
++              </tbody>
++            </table>
++          </div>
++        </section>
++
++        <section class="card overflow-hidden">
++          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-gray-100 p-5 dark:border-dark-700">
++            <div><h2 class="font-semibold text-gray-900 dark:text-white">{{ label('errorsTitle') }}</h2><p class="mt-1 text-xs text-gray-500">{{ label('errorsListHint') }}</p></div>
++            <RouterLink to="/admin/usage" class="text-xs text-primary-600 hover:underline">{{ label('openErrors') }}</RouterLink>
++          </div>
++          <div v-if="!snapshot.errors.items.length" class="p-10 text-center text-sm text-gray-500">{{ label('emptyErrors') }}</div>
++          <div v-else class="divide-y divide-gray-100 dark:divide-dark-700">
++            <button v-for="row in snapshot.errors.items" :key="row.id" class="flex w-full flex-wrap items-start gap-3 px-5 py-4 text-left hover:bg-gray-50 dark:hover:bg-dark-800" data-testid="request-error" @click="openError(row.id)">
++              <span class="rounded-lg bg-red-50 px-2 py-1 text-xs font-semibold tabular-nums text-red-700 dark:bg-red-950 dark:text-red-300">{{ row.status_code }}</span>
++              <div class="min-w-0 flex-1"><div class="break-words text-sm text-gray-900 dark:text-white">{{ row.message.slice(0, 320) || row.type }}</div><div class="mt-2 flex flex-wrap gap-3 text-xs text-gray-500"><span>{{ row.account_name || (row.account_id == null ? '—' : '#' + row.account_id) }}</span><span>{{ row.model || '—' }}</span><span>{{ row.phase }}</span></div></div>
++              <time class="text-xs text-gray-500">{{ time(row.created_at) }}</time>
++            </button>
++          </div>
++        </section>
++        <footer class="space-y-1 text-xs leading-6 text-gray-500 dark:text-gray-400"><p>{{ t('admin.ops.availability.windowNote', { start: time(snapshot.start), end: time(snapshot.end) }) }}</p><p>{{ label('recordsNote') }}</p></footer>
++      </template>
++    </div>
++
++    <OpsErrorDetailModal v-model:show="showError" :error-id="selectedErrorId" error-type="request" />
++    <BaseDialog :show="!!traceRequest" :title="label('traceTitle')" width="extra-wide" @close="closeTrace">
++      <div class="space-y-4 p-4">
++        <p class="break-all font-mono text-xs text-gray-500">{{ label('requestId') }}: {{ traceRequest }}</p>
++        <p class="text-xs text-gray-500">{{ label('traceHint') }}</p>
++        <p v-if="traceLoading" role="status">{{ label('loading') }}</p>
++        <p v-else-if="traceError" role="alert" class="text-amber-700">{{ label('traceFailed') }}</p>
++        <template v-else>
++          <div class="rounded-xl bg-gray-50 p-4 dark:bg-dark-900">
++            <p v-if="finalResponse" data-testid="final-response" class="font-medium">{{ label('finalResponse') }}: {{ numberField(finalResponse.extra?.status_code) ?? '—' }} · {{ label('account') }} #{{ finalResponse.account_id ?? '—' }}</p>
++            <p v-else>{{ label('pendingResponse') }}</p>
++            <p class="mt-2 text-xs text-gray-500">{{ label('streamNote') }}</p>
++          </div>
++          <p v-if="!traceLogs.length" class="text-sm text-gray-500">{{ label('noTraceLogs') }}</p>
++          <div v-for="row in traceLogs" :key="row.id" class="border-b border-gray-100 pb-3 text-xs dark:border-dark-700">
++            <div class="flex flex-wrap gap-3 text-gray-500"><span>{{ time(row.created_at) }}</span><span>{{ row.level }}</span><span v-if="row.account_id">{{ label('account') }} #{{ row.account_id }}</span></div>
++            <p class="mt-2 break-words font-mono">{{ row.message.slice(0, 500) }}</p>
++          </div>
++        </template>
++      </div>
++    </BaseDialog>
++  </AppLayout>
++</template>
+diff --git a/frontend/src/views/admin/__tests__/AvailabilityMonitorView.spec.ts b/frontend/src/views/admin/__tests__/AvailabilityMonitorView.spec.ts
+new file mode 100644
+index 000000000..6e1a6edc6
+--- /dev/null
++++ b/frontend/src/views/admin/__tests__/AvailabilityMonitorView.spec.ts
+@@ -0,0 +1,144 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { flushPromises, mount, RouterLinkStub, type VueWrapper } from '@vue/test-utils'
++import AvailabilityMonitorView from '../AvailabilityMonitorView.vue'
++
++const api = vi.hoisted(() => ({
++  getDashboardOverview: vi.fn(),
++  listSystemLogs: vi.fn(),
++  listRequestErrors: vi.fn()
++}))
++vi.mock('@/api/admin/ops', () => ({ opsAPI: api, default: api }))
++vi.mock('vue-i18n', async (importOriginal) => ({
++  ...await importOriginal<typeof import('vue-i18n')>(),
++  useI18n: () => ({
++    t: (key: string, values?: Record<string, unknown>) => key + (values ? JSON.stringify(values) : '')
++  })
++}))
++
++const switchEvent = { id: 1, created_at: '2026-09-05T04:59:00Z', message: 'openai.upstream_failover_switching', account_id: 3, request_id: 'req-one', model: 'test-model', extra: { upstream_status: 502 } }
++const cooldownEvent = { id: 2, created_at: '2026-09-05T04:59:01Z', message: 'openai_model_transient_state', account_id: 3, platform: null, model: 'test-model', extra: { cooldown_ms: 10000, failure_streak: 1 } }
++const page = (items: unknown[], total = items.length) => ({ items, total, page: 1, page_size: 20, pages: 1 })
++let wrapper: VueWrapper | undefined
++let hidden: ReturnType<typeof vi.spyOn>
++
++function render() {
++  wrapper = mount(AvailabilityMonitorView, { global: { stubs: {
++    AppLayout: { template: '<div><slot /></div>' },
++    RouterLink: RouterLinkStub,
++    Select: { props: ['modelValue', 'options'], emits: ['update:modelValue'], template: '<select :value="modelValue" @change="$emit(\'update:modelValue\', $event.target.value)"><option v-for="o in options" :key="o.value" :value="o.value">{{ o.label }}</option></select>' },
++    BaseDialog: { props: ['show'], template: '<div v-if="show" data-testid="dialog"><slot /></div>' },
++    OpsErrorDetailModal: { props: ['show', 'errorId'], template: '<div v-if="show" data-testid="error-detail">{{ errorId }}</div>' }
++  } } })
++  return wrapper
++}
++
++beforeEach(() => {
++  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
++  vi.setSystemTime(new Date('2026-09-05T05:00:00Z'))
++  vi.clearAllMocks()
++  hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
++  api.getDashboardOverview.mockResolvedValue({ ttft: { p95_ms: 6000 } })
++  api.listSystemLogs.mockImplementation(async (params) => page(params.event === 'openai.upstream_failover_switching' ? [switchEvent] : [cooldownEvent]))
++  api.listRequestErrors.mockResolvedValue(page([{ id: 9, created_at: '2026-09-05T04:59:02Z', status_code: 503, message: 'Upstream failed', type: 'upstream_error', model: 'test-model', account_id: 3, account_name: 'Fixture account', phase: 'upstream' }]))
++})
++
++afterEach(() => {
++  wrapper?.unmount()
++  wrapper = undefined
++  vi.restoreAllMocks()
++  vi.useRealTimers()
++})
++
++describe('AvailabilityMonitorView', () => {
++  it('uses one window and exact event filters, retaining cooldowns with no platform or request ID', async () => {
++    const view = render()
++    await flushPromises()
++    expect(api.listSystemLogs).toHaveBeenCalledTimes(2)
++    const params = api.listSystemLogs.mock.calls[0][0]
++    expect(params).toMatchObject({ start_time: '2026-09-05T04:30:00.000Z', end_time: '2026-09-05T05:00:00.000Z', event: 'openai.upstream_failover_switching', page_size: 20 })
++    expect(params).not.toHaveProperty('platform')
++    expect(params).not.toHaveProperty('q')
++    expect(api.getDashboardOverview.mock.calls[0][0]).toMatchObject({ start_time: params.start_time, end_time: params.end_time, platform: 'openai' })
++    expect(view.get('[data-testid="switches"]').text()).toBe('1')
++    expect(view.text()).toContain('cooldownEvent')
++    expect(view.findAll('[data-testid="trace"]')).toHaveLength(1)
++    expect(view.text()).toContain('ttftNote')
++    await view.get('[data-testid="request-error"]').trigger('click')
++    expect(view.get('[data-testid="error-detail"]').text()).toBe('9')
++  })
++
++  it('does not present missing TTFT or an initial fetch failure as healthy zero values', async () => {
++    api.getDashboardOverview.mockResolvedValue({ ttft: { p95_ms: null } })
++    const view = render()
++    await flushPromises()
++    expect(view.get('[data-testid="ttft"]').text()).toBe('—')
++    view.unmount()
++    api.getDashboardOverview.mockRejectedValue(new Error('unavailable'))
++    const failed = render()
++    await flushPromises()
++    expect(failed.find('[role="alert"]').exists()).toBe(true)
++    expect(failed.find('[data-testid="switches"]').exists()).toBe(false)
++    expect(failed.text()).not.toContain('emptyEvents')
++  })
++
++  it('retains the last coherent snapshot when one refresh query fails', async () => {
++    const view = render()
++    await flushPromises()
++    api.listSystemLogs.mockRejectedValueOnce(new Error('timeout'))
++    api.listRequestErrors.mockResolvedValue(page([], 0))
++    await view.get('[data-testid="refresh"]').trigger('click')
++    await flushPromises()
++    expect(view.find('[role="alert"]').exists()).toBe(true)
++    expect(view.get('[data-testid="errors"]').text()).toBe('1')
++    expect(view.get('[data-testid="switches"]').text()).toBe('1')
++  })
++
++  it('ignores a stale response after the time window changes', async () => {
++    const view = render()
++    await flushPromises()
++    let resolveOld: (value: unknown) => void = () => {}
++    api.getDashboardOverview.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
++    await view.get('[data-testid="refresh"]').trigger('click')
++    const oldSignal = api.getDashboardOverview.mock.calls.at(-1)![1].signal
++    await view.get('select').setValue('5m')
++    await flushPromises()
++    expect(oldSignal.aborted).toBe(true)
++    resolveOld({ ttft: { p95_ms: 99000 } })
++    await flushPromises()
++    expect(view.get('[data-testid="ttft"]').text()).toContain('6.00')
++    expect(view.get('[data-testid="ttft"]').text()).not.toContain('99.00')
++  })
++
++  it('pauses automatic reads while hidden and stops them when unmounted', async () => {
++    const view = render()
++    await flushPromises()
++    hidden.mockReturnValue(true)
++    document.dispatchEvent(new Event('visibilitychange'))
++    vi.advanceTimersByTime(120_000)
++    await flushPromises()
++    expect(api.getDashboardOverview).toHaveBeenCalledTimes(1)
++    hidden.mockReturnValue(false)
++    document.dispatchEvent(new Event('visibilitychange'))
++    await flushPromises()
++    expect(api.getDashboardOverview).toHaveBeenCalledTimes(2)
++    view.unmount()
++    vi.advanceTimersByTime(120_000)
++    expect(api.getDashboardOverview).toHaveBeenCalledTimes(2)
++  })
++
++  it('shows the correlated final account and HTTP status without claiming stream success or displaying raw extra data', async () => {
++    const view = render()
++    await flushPromises()
++    api.listSystemLogs.mockResolvedValueOnce(page([
++      { id: 20, request_id: 'different', message: 'http request completed', account_id: 99, created_at: '2026-09-05T05:00:00Z', extra: { status_code: 500 } },
++      { id: 21, request_id: 'req-one', message: 'http request completed', account_id: 4, created_at: '2026-09-05T04:59:03Z', extra: { status_code: 200, token: 'do-not-render-extra' } }
++    ]))
++    await view.get('[data-testid="trace"]').trigger('click')
++    await flushPromises()
++    expect(view.get('[data-testid="final-response"]').text()).toContain('200')
++    expect(view.get('[data-testid="final-response"]').text()).toContain('#4')
++    expect(view.text()).toContain('streamNote')
++    expect(view.text()).not.toContain('do-not-render-extra')
++    expect(view.text()).not.toContain('#99')
++  })
++})
+diff --git a/frontend/src/views/admin/__tests__/GroupsView.codexManifest.spec.ts b/frontend/src/views/admin/__tests__/GroupsView.codexManifest.spec.ts
+index 9595d27ed..bd7fa1af3 100644
+--- a/frontend/src/views/admin/__tests__/GroupsView.codexManifest.spec.ts
++++ b/frontend/src/views/admin/__tests__/GroupsView.codexManifest.spec.ts
+@@ -48,6 +48,10 @@ vi.mock("@/stores/app", () => ({
+   }),
+ }));
+ 
++vi.mock("@/stores/auth", () => ({
++  useAuthStore: () => ({ isSimpleMode: false }),
++}));
++
+ vi.mock("@/stores/onboarding", () => ({
+   useOnboardingStore: () => ({
+     isCurrentStep: vi.fn(() => false),
+@@ -122,7 +126,7 @@ const sourceGroup = {
+   account_count: 1,
+   active_account_count: 1,
+   rate_limited_account_count: 0,
+-  models_list_config: undefined,
++  model_allowlist: undefined,
+   codex_models_manifest_config: {
+     enabled: false,
+     account_ids: [],

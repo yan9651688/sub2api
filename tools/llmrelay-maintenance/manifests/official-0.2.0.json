@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "image": "weishaw/sub2api:0.2.0@sha256:553864545ec1b446c4b3e3b394599523463de2ff93170b4a5b0ad00026c8b945",
+  "revision": "aa236488351eb71e120fc2b6fb32e36b0374c918",
+  "migrations_sha256": "cfd6e44c66258419248741d14d9981fc734a314cab00ee95c44547f7abceef1e"
+}
