@@ -53,6 +53,7 @@ func (h *OpsHandler) ListSystemLogs(c *gin.Context) {
 	}
 
 	filter := &service.OpsSystemLogFilter{
+		Event:           strings.TrimSpace(c.Query("event")),
 		Page:            page,
 		PageSize:        pageSize,
 		StartTime:       &start,

@@ -1081,6 +1081,11 @@ func buildOpsSystemLogsWhere(filter *service.OpsSystemLogFilter) (string, []any,
 		hasConstraint = true
 	}
 	if filter != nil {
+		if v := strings.TrimSpace(filter.Event); v != "" {
+			args = append(args, v)
+			clauses = append(clauses, "l.message = $"+itoa(len(args)))
+			hasConstraint = true
+		}
 		if v := strings.TrimSpace(filter.Host); v != "" {
 			args = append(args, v)
 			clauses = append(clauses, "l.host = $"+itoa(len(args)))

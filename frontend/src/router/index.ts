@@ -414,6 +414,18 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/availability',
+    name: 'AdminAvailability',
+    component: () => import('@/views/admin/AvailabilityMonitorView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Scheduling Monitor',
+      titleKey: 'admin.ops.availability.title',
+      descriptionKey: 'admin.ops.availability.description'
+    }
+  },
+  {
     path: '/admin/ops',
     name: 'AdminOps',
     component: () => import('@/views/admin/ops/OpsDashboard.vue'),

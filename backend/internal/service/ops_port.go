@@ -196,6 +196,7 @@ type OpsInsertSystemLogInput struct {
 }
 
 type OpsSystemLogFilter struct {
+	Event     string // Exact event message; empty preserves the existing log search.
 	StartTime *time.Time
 	EndTime   *time.Time
 	Host      string

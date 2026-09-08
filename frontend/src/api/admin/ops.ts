@@ -845,6 +845,7 @@ export interface OpsSystemLog {
 export type OpsSystemLogListResponse = PaginatedResponse<OpsSystemLog>
 
 export interface OpsSystemLogQuery {
+  event?: string
   page?: number
   page_size?: number
   time_range?: '5m' | '30m' | '1h' | '6h' | '24h' | '7d' | '30d'
@@ -1128,8 +1129,8 @@ export async function updateErrorResolved(errorId: number, resolved: boolean): P
 }
 
 // New split endpoints
-export async function listRequestErrors(params: OpsErrorListQueryParams): Promise<OpsErrorLogsResponse> {
-  const { data } = await apiClient.get<OpsErrorLogsResponse>('/admin/ops/request-errors', { params })
+export async function listRequestErrors(params: OpsErrorListQueryParams, options: OpsRequestOptions = {}): Promise<OpsErrorLogsResponse> {
+  const { data } = await apiClient.get<OpsErrorLogsResponse>('/admin/ops/request-errors', { params, signal: options.signal })
   return data
 }
 
@@ -1268,8 +1269,8 @@ export async function resetRuntimeLogConfig(): Promise<OpsRuntimeLogConfig> {
   return data
 }
 
-export async function listSystemLogs(params: OpsSystemLogQuery): Promise<OpsSystemLogListResponse> {
-  const { data } = await apiClient.get<OpsSystemLogListResponse>('/admin/ops/system-logs', { params })
+export async function listSystemLogs(params: OpsSystemLogQuery, options: OpsRequestOptions = {}): Promise<OpsSystemLogListResponse> {
+  const { data } = await apiClient.get<OpsSystemLogListResponse>('/admin/ops/system-logs', { params, signal: options.signal })
   return data
 }
 
