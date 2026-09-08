@@ -1,3 +1,5 @@
+> LLMRepay 定制版：当前版本 `0.2.2-llmrepay.2`，版本规则、功能补丁与构建说明见 [LLMREPAY.md](docs/LLMREPAY.md)。
+
 <div align="center">
 
 <img src="assets/logo.svg" alt="Sub2API Logo" width="128" />
