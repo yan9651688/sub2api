@@ -1,12 +1,14 @@
-# LLMRepay 定制版
+# LLMReplay 定制版
 
-当前版本：`0.2.2-llmrepay.2`。维护分支：`codex/llmrepay`。
+当前版本：`0.2.2-llmreplay.2`。维护分支：`codex/llmrepay`。
 
 ## 版本规则
 
-使用 `<上游版本>-llmrepay.<修订号>`，固定保留 `llmrepay` 拼写。本次为 `0.2.2-llmrepay.2`；同一上游版本后续依次使用 `.3`、`.4`。升级上游基础版本时，将前面的版本同步为实际基础版本，并从修订号 `.1` 开始。
+2026-09-08：按用户更正，正式后缀为 `llmreplay`。此前误写的 `0.2.2-llmrepay.2` 标签作为历史记录保留；同一代码的名称修正版为 `0.2.2-llmreplay.2`。维护分支继续沿用原有路径，以保留已有链接。
 
-程序版本的源码入口为 `backend/cmd/server/VERSION`。发布时同步该文件、Git 标签、构建参数和镜像标签。Git 标签采用完整版本字符串，例如 `0.2.2-llmrepay.2`。历史的 `availability.1` 和临时的 `memory.1` 名称仅保留在历史发布记录中。
+使用 `<上游版本>-llmreplay.<修订号>`，固定保留 `llmreplay` 拼写。本次为 `0.2.2-llmreplay.2`；同一上游版本后续依次使用 `.3`、`.4`。升级上游基础版本时，将前面的版本同步为实际基础版本，并从修订号 `.1` 开始。
+
+程序版本的源码入口为 `backend/cmd/server/VERSION`。发布时同步该文件、Git 标签、构建参数和镜像标签。Git 标签采用完整版本字符串，例如 `0.2.2-llmreplay.2`。历史的 `availability.1` 和临时的 `memory.1` 名称仅保留在历史发布记录中。
 
 ## 基础与功能
 
